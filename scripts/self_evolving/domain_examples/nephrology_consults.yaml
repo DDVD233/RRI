@@ -1,0 +1,63 @@
+# Example custom domain for the RRI generator.
+#
+#   SE_DOMAIN=$PWD/scripts/self_evolving/domain_examples/nephrology_consults.yaml \
+#       bash scripts/self_evolving/train/run_rri.sh
+#
+# Every key is optional except DATASET_BRIEF. Keys not set here come from the `base`
+# bundle (scripts/self_evolving/domains.py: medical, general, prbench, profbench,
+# medxpert). `general` is the right base for most medical targets: it describes what
+# the model is for without naming any benchmark.
+#
+# DATASET_BRIEF is what the proposer and the meta-optimizer are told about the target.
+# Describe the KIND of request, who asks it and what a good answer must get right.
+# Never paste evaluation items, rubric lines or paraphrases of them: the method
+# assumes zero access to the evaluation set.
+base: general
+
+NAME: nephrology_consults
+BENCH_NAME: nephrology consult support
+
+DATASET_BRIEF: >-
+  TARGET USE (general description; there are NO example items): an assistant that
+  hospital clinicians consult about kidney problems. Requests are terse consult
+  questions from internists, surgeons and intensivists: acute kidney injury work-up,
+  electrolyte and acid-base disorders, drug dosing in reduced kidney function,
+  dialysis initiation and modality, contrast and nephrotoxin exposure, and
+  transplant medication interactions. A good answer commits to a specific
+  assessment, names the thresholds, doses and monitoring intervals that decide
+  the case, says what additional data would change the plan, and flags unsafe
+  premises; a bad answer is generic, hedges without committing, or misses the
+  detail that makes this patient different.
+
+# The proposer samples a use case (by weight) and a specialty for every new task.
+USE_CASES:
+  diagnosis: 0.30
+  treatment: 0.35
+  drug_dosing: 0.20
+  documentation: 0.15
+USE_CASE_DESC:
+  diagnosis: >-
+    a diagnostic consult: labs, urine studies, imaging or a clinical course, and
+    what they point to, what they rule out and what to check next
+  treatment: >-
+    a management consult: what to do for this patient now, including fluids,
+    agents, doses, dialysis decisions, monitoring and escalation
+  drug_dosing: >-
+    a dosing question: how kidney function, dialysis or a transplant regimen
+    changes the choice or dose of a specific drug
+  documentation: >-
+    a consult note, sign-out or patient letter built from the facts given
+SPECIALTIES:
+  - nephrology
+  - critical_care
+  - internal_medicine
+  - transplant_medicine
+  - pharmacology
+SPECIALTIES_BY_USE_CASE: null
+
+# The base bundle replaces the name of its reference benchmark in the adversary and
+# analyst prompts; point those replacements at this domain's name.
+REBRAND:
+  - ["HealthBench-Professional", "nephrology consult support"]
+  - ["HealthBench Professional", "nephrology consult support"]
+  - ["HealthBench", "nephrology consult support"]

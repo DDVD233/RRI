@@ -1,0 +1,54 @@
+# Training image for the RRI pipeline (x86_64, CUDA 13). Same software stack as the image the
+# paper's runs used on B200 nodes, without that image's cluster tooling.
+#
+# The base image provides torch, vLLM 0.22, the CUDA 13 toolkit and Python 3.12. On top
+# of it: verl's dependencies, the RRI extras, flash-attention 2 and flashinfer.
+#
+#   docker build -f docker/Dockerfile.rri -t rri:cu130 .
+#   docker run --gpus all --rm -it --shm-size=32g --ipc=host \
+#       -v $HOME/.cache/huggingface:/root/.cache/huggingface -v $PWD/outputs:/workspace/rri/outputs \
+#       --env-file scripts/self_evolving/.env rri:cu130 bash
+ARG BASE_IMAGE=vllm/vllm-openai:gemma-x86_64-cu130
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git git-lfs wget curl unzip build-essential ninja-build cmake tmux \
+    && git lfs install --system \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python
+
+COPY requirements.txt requirements-rri.txt /tmp/
+RUN pip install -r /tmp/requirements.txt -r /tmp/requirements-rri.txt
+
+# Flash-attention 2, compiled against the base image's torch.
+ARG FLASH_ATTN_MAX_JOBS=32
+RUN FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=${FLASH_ATTN_MAX_JOBS} \
+    pip install flash-attn --no-build-isolation --no-binary flash-attn
+RUN pip install 'flashinfer-python[cu13]'
+
+# Recent transformers for Qwen3.5 / Qwen3.6. trl pinned: newer releases dropped
+# AutoModelForCausalLMWithValueHead, which verl imports.
+RUN pip install -U transformers && pip install --no-deps trl==0.27.0
+
+# requirements.txt pins numpy<2, but pymilvus and the trainer need numpy 2.x;
+# remove every numpy artifact and reinstall so importlib.metadata sees one version.
+RUN pip uninstall -y numpy 2>/dev/null || true \
+    && rm -rf /usr/local/lib/python3.12/dist-packages/numpy \
+              /usr/local/lib/python3.12/dist-packages/numpy.libs \
+              /usr/local/lib/python3.12/dist-packages/numpy-*.dist-info \
+    && pip install "numpy>=2.0"
+RUN python -c "import nltk; nltk.download('punkt_tab', quiet=True); nltk.download('punkt', quiet=True)" || true
+
+# CUDA 13 toolkit headers can trip nvcc's version check inside JIT builds.
+ENV NVCC_PREPEND_FLAGS=-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK
+
+WORKDIR /workspace/rri
+COPY . /workspace/rri
+ENV PYTHONPATH=/workspace/rri
+ENTRYPOINT []
+CMD ["bash"]

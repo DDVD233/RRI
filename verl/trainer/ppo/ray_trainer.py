@@ -1,0 +1,3062 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2023-2024 SGLang Team
+# Copyright 2025 ModelBest Inc. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+PPO Trainer with Ray-based single controller.
+This trainer supports model-agonistic model initialization with huggingface
+"""
+
+import json
+import os
+import uuid
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+from pprint import pprint
+from typing import Any, Optional
+
+import numpy as np
+import torch
+from omegaconf import OmegaConf, open_dict
+from torch.utils.data import Dataset, Sampler
+from torchdata.stateful_dataloader import StatefulDataLoader
+from tqdm import tqdm
+
+from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
+from verl.single_controller.ray.base import create_colocated_worker_cls
+from verl.trainer.config import AlgoConfig
+from verl.trainer.distillation.losses import is_distillation_enabled
+from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.metric_utils import (
+    compute_data_metrics,
+    compute_throughout_metrics,
+    compute_timing_metrics,
+    compute_variance_proxy_metrics,
+    process_validation_metrics,
+)
+from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_reference_policy,
+    need_reward_model,
+    need_teacher_policy,
+)
+from verl.utils import tensordict_utils as tu
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.debug import marked_timer
+from verl.utils.import_utils import deprecated, load_class_from_fqn
+from verl.utils.metric import reduce_metrics
+from verl.utils.py_functional import rename_dict
+from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.skip.skip_manager import SkipManager
+from verl.utils.torch_functional import masked_mean
+from verl.utils.tracking import ValidationGenerationsLogger
+from verl.workers.config import DistillationConfig, EngineConfig
+from verl.workers.rollout.llm_server import LLMServerManager
+from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
+    """Apply KL penalty to the token-level rewards.
+
+    This function computes the KL divergence between the reference policy and current policy,
+    then applies a penalty to the token-level rewards based on this divergence.
+
+    Args:
+        data (DataProto): The data containing batched model outputs and inputs.
+        kl_ctrl (core_algos.AdaptiveKLController): Controller for adaptive KL penalty.
+        kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
+
+    Returns:
+        tuple: A tuple containing:
+            - The updated data with token-level rewards adjusted by KL penalty
+            - A dictionary of metrics related to the KL penalty
+    """
+    response_mask = data.batch["response_mask"]
+    token_level_scores = data.batch["token_level_scores"]
+    batch_size = data.batch.batch_size[0]
+
+    # compute kl between ref_policy and current policy
+    # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
+    kld = core_algos.kl_penalty(
+        data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
+    )  # (batch_size, response_length)
+    kld = kld * response_mask
+    beta = kl_ctrl.value
+
+    token_level_rewards = token_level_scores - beta * kld
+
+    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+    current_kl = torch.mean(current_kl, dim=0).item()
+
+    # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
+    kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+    data.batch["token_level_rewards"] = token_level_rewards
+
+    metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
+
+    return data, metrics
+
+
+def compute_response_mask(data: DataProto):
+    """Compute the attention mask for the response part of the sequence.
+
+    This function extracts the portion of the attention mask that corresponds to the model's response,
+    which is used for masking computations that should only apply to response tokens.
+
+    Args:
+        data (DataProto): The data containing batched model outputs and inputs.
+
+    Returns:
+        torch.Tensor: The attention mask for the response tokens.
+    """
+    responses = data.batch["responses"]
+    response_length = responses.size(1)
+    attention_mask = data.batch["attention_mask"]
+    return attention_mask[:, -response_length:]
+
+
+def compute_spec_decode_metrics(
+    spec_drafts,
+    spec_accepts,
+    spec_verifies,
+    non_padding_mask=None,
+) -> dict:
+    """Aggregate per-request speculative decoding stats.
+
+    Ratios are computed per request and then averaged, so long and short
+    responses have equal metric weight.
+
+    The three inputs come from the rollout engine (vLLM request spec-decode
+    stats or sglang ``meta_info["spec_*"]`` keys). Either all three are ``None``
+    (caller didn't fetch them, e.g. spec rollout disabled) and the function
+    is a no-op, or all three are populated; mixed state is a programmer error.
+
+    ``non_padding_mask`` is a numpy bool array used by sync PPO to drop padded
+    placeholder samples; pass ``None`` for async PPO.
+    """
+    if spec_drafts is None and spec_accepts is None and spec_verifies is None:
+        return {}
+    assert spec_drafts is not None and spec_accepts is not None and spec_verifies is not None, (
+        "spec_decode metrics require all three of spec_num_draft_tokens / "
+        "spec_num_accepted_tokens / spec_num_verify_steps; got partial inputs"
+    )
+
+    drafts = spec_drafts.tolist() if hasattr(spec_drafts, "tolist") else list(spec_drafts)
+    accepts = spec_accepts.tolist() if hasattr(spec_accepts, "tolist") else list(spec_accepts)
+    verifies = spec_verifies.tolist() if hasattr(spec_verifies, "tolist") else list(spec_verifies)
+
+    if non_padding_mask is not None:
+        drafts = [d for d, keep in zip(drafts, non_padding_mask, strict=True) if keep]
+        accepts = [a for a, keep in zip(accepts, non_padding_mask, strict=True) if keep]
+        verifies = [v for v, keep in zip(verifies, non_padding_mask, strict=True) if keep]
+
+    if len(drafts) == 0:
+        return {}
+
+    # Treat zero-denominator samples as 0.0 and keep them in the mean.
+    per_sample_accept_rate = [(a / d) if d > 0 else 0.0 for a, d in zip(accepts, drafts, strict=True)]
+    per_sample_accept_length = [(1.0 + a / v) if v > 0 else 0.0 for a, v in zip(accepts, verifies, strict=True)]
+
+    n = len(drafts)
+    return {
+        "rollout/spec_accept_rate": float(sum(per_sample_accept_rate) / n),
+        "rollout/spec_accept_length": float(sum(per_sample_accept_length) / n),
+    }
+
+
+def compute_trained_span_metrics(data: DataProto, tokenizer) -> dict:
+    """Metrics that distinguish "the query tokens are TRAINED" from "they are not".
+
+    In a multi-turn retrieval trajectory the tool responses are loss-masked while the
+    model's own turns are not, so `trained_token_frac` sits well below 1 and the
+    tool-call markers appear inside the trained span. The previous two-phase loop
+    emitted a rebuilt single-turn answer instead, which has no masked spans and no
+    tool call at all — it reads as exactly 1.0 and 0.0. That difference is the whole
+    point of the rewrite, and without these two numbers it is invisible in wandb.
+
+    Cheap: one decode of the trained tokens for a small sample of rows.
+    """
+    if "response_mask" not in data.batch:
+        return {}
+    mask = data.batch["response_mask"]
+    resp_len = mask.shape[-1]
+    attn = data.batch["attention_mask"][:, -resp_len:]
+    denom = attn.sum().clamp(min=1)
+    out = {"batch/trained_token_frac": float((mask.sum() / denom).item())}
+    try:
+        n = min(int(os.environ.get("VERL_TRAINED_SPAN_SAMPLE", "16")), mask.shape[0])
+        if n > 0:
+            resp = data.batch["responses"]
+            hits = 0
+            for i in range(n):
+                ids = resp[i][mask[i].bool()[: resp.shape[1]]]
+                if "<tool_call>" in tokenizer.decode(ids, skip_special_tokens=True):
+                    hits += 1
+            out["batch/tool_call_in_trained_frac"] = hits / n
+    except Exception as e:  # telemetry must never break a step
+        print(f"[trained_span_metrics] skipped: {type(e).__name__}: {e}", flush=True)
+    return out
+
+
+def _as_list(v) -> list:
+    """Coerce a possibly-numpy, possibly-None sequence to a plain list.
+
+    `x or []` is the natural way to write this and it is WRONG here: batch fields
+    reach the trainer as numpy arrays (reward extras are built with np.array, and
+    collated non-tensor fields such as `rubric_items` arrive the same way), and
+    `arr or []` raises "truth value of an array with more than one element is
+    ambiguous". Both evolution hooks swallow exceptions so they can never break
+    training, so that ValueError does not crash anything — it just turns the whole
+    evolution round into a silent no-op while the config still says it is on.
+    """
+    if v is None:
+        return []
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    return [v]
+
+
+def _conversation_text_for_spec_gap(ex_info: dict) -> str:
+    """The clinician turns only, as the referee should see them.
+
+    Deliberately excludes any system/solver prompt and any retrieved passages: the
+    referee judges clinical substance, and telling it what output format was
+    demanded (or what evidence was available) would turn it into a
+    format-compliance or evidence-use judge instead.
+    """
+    conv = _as_list(ex_info.get("conversation"))
+    parts = []
+    for m in conv:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role", ""))
+        if role not in ("user", "system"):
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+        if content:
+            parts.append(f"{role}: {content}")
+    if parts:
+        return "\n\n".join(parts)
+    return str(ex_info.get("question") or ex_info.get("prompt") or "")
+
+
+def _fold_retrieval_group_bonus(data: DataProto, reward_tensor, reward_extra_infos_dict: dict):
+    """Add the group-relative retrieval-quality bonus to the token-level reward.
+
+    Second graded component of the retrieval RL run. `retrieval_coverage` measures
+    whether the evidence a rollout RETRIEVED supplies what the rubric grades —
+    independent of whether the answer used it — so the query tokens get a signal of
+    their own instead of inheriting only the answer's.
+
+    Why group-relative, and why it must live here: the reward manager is strictly
+    per-sample (`run_single` slices to one row, and the n rollouts of a group are
+    dispatched to different workers), so the group only exists at this point, where
+    `uid` is available. Centering each searching rollout's coverage on the mean of
+    the OTHER searching rollouts in its group makes the deltas sum to ~0 within the
+    group. That matters: it leaves the group mean — and therefore every non-searching
+    rollout's GRPO advantage — untouched, so the decision to search at all stays
+    arbitrated by the answer reward alone (the unbiased signal), while coverage only
+    ranks QUERY QUALITY among the rollouts that did search. Paying a flat bonus for
+    searching would instead make searching dominant, including on the ~26% of
+    criteria whose facts the KB does not hold, where even a perfect query scores 0.
+
+    Only rollouts that actually searched are adjusted. A rollout whose coverage judge
+    failed (`retrieval_judged` == 0) is left alone — a judge outage degrades to
+    "retrieval reward off", never to "this rollout retrieved nothing".
+    """
+    import os as _os
+
+    w = float(_os.environ.get("HB_RETRIEVAL_WEIGHT", "0.0"))
+    if w <= 0.0 or _os.environ.get("HB_RETRIEVAL_GROUP_BASELINE", "1") != "1":
+        return reward_tensor, {}
+    if "retrieval_coverage" not in reward_extra_infos_dict:
+        return reward_tensor, {}
+    uids = data.non_tensor_batch.get("uid")
+    if uids is None:
+        return reward_tensor, {}
+
+    c0 = float(_os.environ.get("HB_RETRIEVAL_NOSEARCH_COVERAGE", "0.35"))
+    # Shared parser, not a second float(): HB_SCORE_MIN accepts "none" to disable the
+    # floor entirely, and a local float() here crashed the retrieval arm at step 1 on it.
+    # -inf is the correct result and needs no special case -- `lo - w` stays -inf and
+    # np.clip then simply applies no lower bound, which is what "no floor" means.
+    from verl.utils.reward_score.healthbench_pro import parse_score_min
+
+    lo = min(0.0, parse_score_min(_os.environ.get("HB_SCORE_MIN", "0.0")))
+    cov = np.asarray(reward_extra_infos_dict["retrieval_coverage"], dtype=np.float64)
+    judged = np.asarray(
+        reward_extra_infos_dict.get("retrieval_judged", np.zeros_like(cov)), dtype=np.float64
+    )
+    used = np.asarray(
+        reward_extra_infos_dict.get("retrieval_used", np.zeros_like(cov)), dtype=np.float64
+    )
+    uids = np.asarray(uids)
+    if len(cov) != len(uids):
+        # This module has no module-level logger (the `logger` inside the training
+        # loop is a Tracking object), and silence here would hide a disabled reward
+        # component for a whole run.
+        print(
+            f"[retrieval_bonus] SKIPPED: coverage len {len(cov)} != batch len {len(uids)}",
+            flush=True,
+        )
+        return reward_tensor, {}
+
+    # The scalar reward lives at the LAST valid response token of each row (that is
+    # where the reward manager writes it), so the bonus has to land on the same index.
+    resp_len = reward_tensor.shape[-1]
+    valid = data.batch["attention_mask"][:, -resp_len:].sum(dim=-1).to(torch.int64)
+
+    eligible = (used > 0.5) & (judged > 0.5)
+
+    # Counterfactual coverage for a group with only ONE searcher, where there is no
+    # within-group comparison to make. Estimated from THIS batch's own searching
+    # rollouts rather than from a hand-set constant: the constant was 0.35 against a
+    # measured coverage mean of 0.517, which handed a lone searcher a flat
+    # 0.20*(0.517-0.35) = +0.033 for searching at all, regardless of how well it
+    # searched -- the exact "pay for searching, not for searching well" bias the
+    # group-relative design exists to avoid. It also silently goes stale every time
+    # the coverage judge is evolved, which now happens every 5 steps. The env value
+    # remains the fallback for a batch with nothing to estimate from.
+    _batch_cov = cov[eligible]
+    c0_batch = float(_batch_cov.mean()) if _batch_cov.size >= 8 else c0
+
+    n_adj, n_clipped, deltas = 0, 0, []
+    for uid in dict.fromkeys(uids.tolist()):
+        idx = np.nonzero(uids == uid)[0]
+        sel = idx[eligible[idx]]
+        if len(sel) == 0:
+            continue
+        base = float(cov[sel].mean()) if len(sel) >= 2 else c0_batch
+        for i in sel:
+            pos = int(valid[i].item()) - 1
+            if pos < 0:
+                continue
+            delta = w * (float(cov[i]) - base)
+            before = float(reward_tensor[i, pos])
+            # Clip to [lo - w, 1 + w], NOT [lo, 1]. The [lo, 1] range bounds the
+            # ANSWER score; bounding the SUM to it conflates two separate terms and
+            # silently truncates the bonus whenever the answer already sits near an
+            # edge. Measured: with training rewards at ~0.92 on generated tasks, 45%
+            # of bonuses hit the CEILING — and only the positive ones, so good
+            # retrieval had its reward cut while bad retrieval kept its full penalty.
+            # The bias grows as scores rise with training, which is exactly when the
+            # held-out retrieval arm peaked (step 10) and then declined.
+            after = float(np.clip(before + delta, lo - w, 1.0 + w))
+            reward_tensor[i, pos] = after
+            # Clipping breaks the sum-to-zero property, and it is ASYMMETRIC: a
+            # negative delta on an already-floored rollout is swallowed while a
+            # positive one is kept, which biases the policy toward searching. Give
+            # the floor at least `w` of headroom (HB_SCORE_MIN <= -HB_RETRIEVAL_WEIGHT)
+            # and watch this rate — a high one means the bonus is one-sided.
+            if abs(after - before - delta) > 1e-9:
+                n_clipped += 1
+            deltas.append(after - before)
+            n_adj += 1
+
+    m = {"reward/retrieval_bonus/n_adjusted": float(n_adj),
+         "reward/retrieval_bonus/clipped_frac": float(n_clipped) / max(1, n_adj),
+         # Logged so the single-searcher counterfactual is checkable rather than
+         # trusted: if this drifts far from the coverage mean the lone-searcher
+         # bonus is once again paying for searching rather than for searching well.
+         "reward/retrieval_bonus/nosearch_baseline": float(c0_batch)}
+    if deltas:
+        d = np.asarray(deltas)
+        m["reward/retrieval_bonus/mean"] = float(d.mean())
+        m["reward/retrieval_bonus/absmean"] = float(np.abs(d).mean())
+        m["reward/retrieval_bonus/max"] = float(d.max())
+        m["reward/retrieval_bonus/min"] = float(d.min())
+    return reward_tensor, m
+
+
+def compute_advantage(
+    data: DataProto,
+    adv_estimator: AdvantageEstimator,
+    gamma: float = 1.0,
+    lam: float = 1.0,
+    num_repeat: int = 1,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> DataProto:
+    """Compute advantage estimates for policy optimization.
+
+    This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
+    The advantage estimates are used to guide policy optimization in RL algorithms.
+
+    Args:
+        data (DataProto): The data containing batched model outputs and inputs.
+        adv_estimator (AdvantageEstimator): The advantage estimator to use (e.g., GAE, GRPO, REINFORCE++).
+        gamma (float, optional): Discount factor for future rewards. Defaults to 1.0.
+        lam (float, optional): Lambda parameter for GAE. Defaults to 1.0.
+        num_repeat (int, optional): Number of times to repeat the computation. Defaults to 1.
+        norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in
+            GRPO. Defaults to True.
+        config (dict, optional): Configuration dictionary for algorithm settings. Defaults to None.
+
+    Returns:
+        DataProto: The updated data with computed advantages and returns.
+    """
+    # Back-compatible with trainers that do not compute response mask in fit
+    if "response_mask" not in data.batch.keys():
+        data.batch["response_mask"] = compute_response_mask(data)
+    # prepare response group
+    if adv_estimator == AdvantageEstimator.GAE:
+        # Compute advantages and returns using Generalized Advantage Estimation (GAE)
+        advantages, returns = core_algos.compute_gae_advantage_return(
+            token_level_rewards=data.batch["token_level_rewards"],
+            values=data.batch["values"],
+            response_mask=data.batch["response_mask"],
+            gamma=gamma,
+            lam=lam,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        if config.get("use_pf_ppo", False):
+            data = core_algos.compute_pf_ppo_reweight_data(
+                data,
+                config.pf_ppo.get("reweight_method"),
+                config.pf_ppo.get("weight_pow"),
+            )
+    elif adv_estimator == AdvantageEstimator.GRPO:
+        # Initialize the mask for GRPO calculation
+        grpo_calculation_mask = data.batch["response_mask"]
+
+        # Call compute_grpo_outcome_advantage with parameters matching its definition
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=grpo_calculation_mask,
+            index=data.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+    else:
+        # handle all other adv estimator type other than GAE and GRPO
+        adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
+        adv_kwargs = {
+            "token_level_rewards": data.batch["token_level_rewards"],
+            "response_mask": data.batch["response_mask"],
+            "config": config,
+        }
+        if "uid" in data.non_tensor_batch:  # optional
+            adv_kwargs["index"] = data.non_tensor_batch["uid"]
+        if "reward_baselines" in data.batch:  # optional
+            adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        # GDPO: pass raw data for per-dimension reward extraction
+        if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+            adv_kwargs["batch"] = data.batch
+        # Add sum_pi_squared for Optimal Token Baseline
+        if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
+            # Check if sum_pi_squared is available
+            assert "sum_pi_squared" in data.batch, (
+                "Step-dependent optimal baseline requires sum_pi_squared from actor. "
+                "Please set actor.calculate_sum_pi_squared=True in config."
+            )
+            adv_kwargs["sum_pi_squared"] = data.batch["sum_pi_squared"]
+            # old_log_probs needed for path-variance proxy: w_t = 1 - 2*exp(old_log_probs) + sum_pi_squared
+            adv_kwargs["old_log_probs"] = data.batch["old_log_probs"]
+            # Get pre-computed rollout IS weights if available
+            rollout_is_weights = data.batch.get("rollout_is_weights", None)
+            adv_kwargs["rollout_is_weights"] = rollout_is_weights
+
+        # calculate advantage estimator
+        advantages, returns = adv_estimator_fn(**adv_kwargs)
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+    return data
+
+
+@deprecated(
+    "main_ppo.py is deprecated, and wil be replaced by main_ppo_sync.py in v0.8.0, please use main_ppo_sync.py instead."
+)
+class RayPPOTrainer:
+    """Distributed PPO trainer using Ray for scalable reinforcement learning.
+
+    This trainer orchestrates distributed PPO training across multiple nodes and GPUs,
+    managing actor rollouts, critic training, and reward computation with Ray backend.
+    Supports various model architectures including FSDP, Megatron, vLLM, and SGLang integration.
+    """
+
+    # TODO: support each role have individual ray_worker_group_cls,
+    # i.e., support different backend of different role
+    def __init__(
+        self,
+        config,
+        tokenizer,
+        role_worker_mapping: dict[Role, WorkerType],
+        resource_pool_manager: ResourcePoolManager,
+        ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
+        processor=None,
+        train_dataset: Optional[Dataset] = None,
+        val_dataset: Optional[Dataset] = None,
+        collate_fn=None,
+        train_sampler: Optional[Sampler] = None,
+        device_name=None,
+    ):
+        """
+        Initialize distributed PPO trainer with Ray backend.
+        Note that this trainer runs on the driver process on a single CPU/GPU node.
+
+        Args:
+            config: Configuration object containing training parameters.
+            tokenizer: Tokenizer used for encoding and decoding text.
+            role_worker_mapping (dict[Role, WorkerType]): Mapping from roles to worker classes.
+            resource_pool_manager (ResourcePoolManager): Manager for Ray resource pools.
+            ray_worker_group_cls (RayWorkerGroup, optional): Class for Ray worker groups. Defaults to RayWorkerGroup.
+            processor: Optional data processor, used for multimodal data
+            train_dataset (Optional[Dataset], optional): Training dataset. Defaults to None.
+            val_dataset (Optional[Dataset], optional): Validation dataset. Defaults to None.
+            collate_fn: Function to collate data samples into batches.
+            train_sampler (Optional[Sampler], optional): Sampler for the training dataset. Defaults to None.
+            device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
+        """
+
+        # Store the tokenizer for text processing
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.config = config
+
+        self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
+        assert self.hybrid_engine, "Currently, only support hybrid engine"
+
+        if self.hybrid_engine:
+            assert Role.ActorRollout in role_worker_mapping or Role.ActorRolloutRef in role_worker_mapping, (
+                f"{role_worker_mapping.keys()=}"
+            )
+
+        self.role_worker_mapping = role_worker_mapping
+        self.resource_pool_manager = resource_pool_manager
+        self.use_reference_policy = need_reference_policy(self.config)
+        self.use_teacher_policy = need_teacher_policy(self.config)
+
+        self.use_rm = need_reward_model(self.config)
+
+        self.use_critic = need_critic(self.config)
+        self.ray_worker_group_cls = ray_worker_group_cls
+        self.device_name = device_name if device_name else self.config.trainer.device
+        self.validation_generations_logger = ValidationGenerationsLogger(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+        )
+
+        # if ref_in_actor is True, the reference policy will be actor without lora applied
+        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
+        if lora_rank <= 0:
+            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+        self.ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+
+        # define in-reward KL control
+        # kl loss control currently not suppoorted
+        if self.config.algorithm.use_kl_in_reward:
+            self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
+
+        self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
+
+        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+        self.checkpoint_manager = None
+        self._init_dump_executor()
+
+    def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
+        """
+        Creates the train and validation dataloaders.
+        """
+        # TODO: we have to make sure the batch size is divisible by the dp size
+        from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
+
+        if train_dataset is None:
+            train_dataset = create_rl_dataset(
+                self.config.data.train_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("train_max_samples", -1),
+            )
+        if val_dataset is None:
+            val_dataset = create_rl_dataset(
+                self.config.data.val_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("val_max_samples", -1),
+            )
+        self.train_dataset, self.val_dataset = train_dataset, val_dataset
+
+        if train_sampler is None:
+            train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+        if collate_fn is None:
+            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+
+            collate_fn = default_collate_fn
+
+        num_workers = self.config.data["dataloader_num_workers"]
+
+        self.train_dataloader = StatefulDataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            num_workers=num_workers,
+            drop_last=True,
+            collate_fn=collate_fn,
+            sampler=train_sampler,
+        )
+
+        val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
+        if val_batch_size is None:
+            val_batch_size = len(self.val_dataset)
+
+        self.val_dataloader = StatefulDataLoader(
+            dataset=self.val_dataset,
+            batch_size=val_batch_size,
+            num_workers=num_workers,
+            shuffle=self.config.data.get("validation_shuffle", True),
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
+        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
+        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+
+        print(
+            f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
+            f"{len(self.val_dataloader)}"
+        )
+
+        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+
+        if self.config.trainer.total_training_steps is not None:
+            total_training_steps = self.config.trainer.total_training_steps
+
+        self.total_training_steps = total_training_steps
+        print(f"Total training steps: {self.total_training_steps}")
+
+        try:
+            OmegaConf.set_struct(self.config, True)
+            with open_dict(self.config):
+                if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
+                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
+                if OmegaConf.select(self.config, "critic.optim"):
+                    self.config.critic.optim.total_training_steps = total_training_steps
+        except Exception as e:
+            print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    @staticmethod
+    def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
+        """Write generation samples as JSONL (runs in background thread)."""
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{global_steps}.jsonl")
+
+        n = len(inputs)
+        base_data = {
+            "input": inputs,
+            "output": outputs,
+            "gts": gts,
+            "score": scores,
+            "step": [global_steps] * n,
+        }
+
+        for k, v in reward_extra_infos_dict.items():
+            if len(v) == n:
+                base_data[k] = v
+
+        with open(filename, "w") as f:
+            for i in range(n):
+                entry = {k: v[i] for k, v in base_data.items()}
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+
+        print(f"Dumped generations to {filename}")
+
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        """Dump rollout/validation samples as JSONL asynchronously."""
+        global_steps = self.global_steps
+        future = self._dump_executor.submit(
+            self._write_generations,
+            inputs,
+            outputs,
+            gts,
+            scores,
+            reward_extra_infos_dict,
+            dump_path,
+            global_steps,
+        )
+        self._dump_futures.append(future)
+        # Clean up completed futures and surface any exceptions early
+        still_pending = []
+        for f in self._dump_futures:
+            if f.done():
+                f.result()  # re-raises if the write failed
+            else:
+                still_pending.append(f)
+        self._dump_futures = still_pending
+
+    def _init_dump_executor(self):
+        """Create or recreate the dump executor and futures list."""
+        self._dump_executor = ThreadPoolExecutor(max_workers=1)
+        self._dump_futures = []
+
+    def _shutdown_dump_executor(self):
+        """Drain pending dump futures and shut down the executor."""
+        for f in self._dump_futures:
+            f.result()
+        self._dump_futures.clear()
+        self._dump_executor.shutdown(wait=True)
+
+    def _log_rollout_data(
+        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
+    ):
+        """Log rollout data to disk.
+        Args:
+            batch (DataProto): The batch containing rollout data
+            reward_extra_infos_dict (dict): Additional reward information to log
+            timing_raw (dict): Timing information for profiling
+            rollout_data_dir (str): Directory path to save the rollout data
+        """
+        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+            sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+
+            reward_extra_infos_to_dump = {
+                k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in reward_extra_infos_dict.items()
+            }
+            if "request_id" in batch.non_tensor_batch:
+                reward_extra_infos_to_dump.setdefault(
+                    "request_id",
+                    batch.non_tensor_batch["request_id"].tolist(),
+                )
+
+            self._dump_generations(
+                inputs=inputs,
+                outputs=outputs,
+                gts=sample_gts,
+                scores=scores,
+                reward_extra_infos_dict=reward_extra_infos_to_dump,
+                dump_path=rollout_data_dir,
+            )
+
+    def _maybe_log_val_generations(self, inputs, outputs, scores):
+        """Log a table of validation samples to the configured logger (wandb or swanlab)"""
+
+        generations_to_log = self.config.trainer.log_val_generations
+
+        if generations_to_log == 0:
+            return
+
+        import numpy as np
+
+        # Create tuples of (input, output, score) and sort by input text
+        samples = list(zip(inputs, outputs, scores, strict=True))
+        samples.sort(key=lambda x: x[0])  # Sort by input text
+
+        # Use fixed random seed for deterministic shuffling
+        rng = np.random.RandomState(42)
+        rng.shuffle(samples)
+
+        # Take first N samples after shuffling
+        samples = samples[:generations_to_log]
+
+        # Log to each configured logger
+        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+
+    def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+
+        # pop those keys for generation
+        batch_keys_to_pop = []
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_keys
+        gen_batch = batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
+        )
+
+        # For agent loop, we need reward model keys to compute score.
+        gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+
+        return gen_batch
+
+    def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
+        """
+        compute reward use colocate reward model
+        """
+        assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+        batch_reward = self.reward_loop_manager.compute_rm_score(batch)
+        return batch_reward
+
+    def _maybe_evolve_reward(self, batch: DataProto, reward_extra_infos_dict: dict) -> dict:
+        """Optional, training-only end-of-step reward evolution.
+
+        When ``reward.reward_evolution.enable`` is set, ask the judge model to (1) rewrite
+        the judging prompt and (2) write/improve an executable ``function_reward`` based on
+        a contrastive set of this step's (question, response, ground_truth, sub-rewards)
+        samples. Artifacts are versioned under ``{default_local_dir}/reward_evolution/`` and
+        the reward function reads the latest valid pair on the next step. Off by default and
+        best-effort: any failure is logged and skipped so it can never break training.
+        """
+        from omegaconf import OmegaConf
+
+        # Read config via OmegaConf.select (lenient under struct mode). Enable if EITHER the
+        # trainer-side reward_evolution.enable OR the reward-side reward_kwargs.evolve_enable
+        # is set (the latter is the path that demonstrably reaches compute_score).
+        re_cfg = OmegaConf.select(self.config, "reward.reward_evolution") or {}
+        rk = OmegaConf.select(self.config, "reward.custom_reward_function.reward_kwargs") or {}
+        enabled = bool(re_cfg.get("enable", False)) or bool(rk.get("evolve_enable", False))
+        if not enabled:
+            return {}
+        every = int(re_cfg.get("every_n_steps", 1) or 1)
+        if every > 1 and (self.global_steps % every != 0):
+            return {}
+
+        def _say(msg: str) -> None:
+            print(f"[reward_evolution] step {self.global_steps}: {msg}", flush=True)
+
+        try:
+            from verl.utils.reward_score import reward_evolution as RE
+
+            api_base = rk.get("api_base", "") or ""
+            api_key = rk.get("api_key", "EMPTY")
+            model_name = rk.get("model_name", "")
+            if not api_base:
+                _say("skip: no judge api_base in reward_kwargs")
+                return {}
+            evolve_dir = (
+                rk.get("evolve_dir", "")
+                or re_cfg.get("evolve_dir", "")
+                or os.path.join(self.config.trainer.default_local_dir, "reward_evolution")
+            )
+            num_examples = int(re_cfg.get("num_examples", 20) or 20)
+            design_max_tokens = int(re_cfg.get("design_max_tokens", 8000) or 8000)
+
+            # Per-sample combined reward: prefer reward_extra_infos_dict, then non_tensor_batch,
+            # then the token-level rm_scores summed over the response dim.
+            n = len(batch)
+            scores = None
+            for src in (reward_extra_infos_dict, batch.non_tensor_batch):
+                if src is not None and ("score" in src or "reward" in src):
+                    scores = src.get("score", src.get("reward"))
+                    break
+            if scores is None and "rm_scores" in batch.batch:
+                scores = batch.batch["rm_scores"].sum(dim=-1).cpu().tolist()
+            if scores is None or len(scores) == 0 or n == 0:
+                _say(f"skip: no per-sample scores (n={n}, extra_keys={list(reward_extra_infos_dict.keys())})")
+                return {}
+            scores = [float(s) for s in scores]
+
+            # Uniformly random sample of this step's cases (the new per-case error-summarization
+            # flow digests them individually, so we want an unbiased slice, not a reward-spread
+            # subset). scores are still required above to confirm rewards were computed.
+            import random as _random
+
+            k = min(num_examples, n)
+            picked = _random.sample(range(n), k)
+
+            examples = []
+            for i in picked:
+                data_item = batch[i]
+                prompt_ids = data_item.batch["prompts"]
+                plen = prompt_ids.shape[-1]
+                resp_ids = data_item.batch["responses"]
+                valid_resp_len = int(data_item.batch["attention_mask"][plen:].sum())
+                resp_str = self.tokenizer.decode(resp_ids[:valid_resp_len], skip_special_tokens=True)
+                gt = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+                ex_info = data_item.non_tensor_batch.get("extra_info", {}) or {}
+                question = ex_info.get("question", "")
+                row = {
+                    key: vals[i]
+                    for key, vals in reward_extra_infos_dict.items()
+                    if hasattr(vals, "__len__") and i < len(vals)
+                }
+                examples.append(RE.make_example(question, resp_str, gt, row))
+
+            _say(f"evolving with {len(examples)} examples -> {evolve_dir}")
+            metrics = (
+                RE.evolve_once_sync(
+                    api_base=api_base,
+                    api_key=api_key,
+                    model_name=model_name,
+                    evolve_dir=evolve_dir,
+                    examples=examples,
+                    step=self.global_steps,
+                    design_max_tokens=design_max_tokens,
+                )
+                or {}
+            )
+            _say(f"done: {metrics}")
+            return metrics
+        except Exception as e:  # noqa: BLE001 — never break training on evolution failure
+            import traceback
+
+            _say(f"FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            return {}
+
+    def _filter_zero_variance_groups(
+        self, batch: DataProto, reward_tensor, reward_extra_infos_dict: dict
+    ) -> tuple[DataProto, Any, dict, dict]:
+        """DAPO-lite: drop whole GRPO groups whose sequence rewards are (near-)identical.
+
+        Zero-variance groups produce zero advantage under group normalization, so they
+        contribute no policy gradient — only wasted forward/backward compute and diluted
+        batch statistics. Groups are identified by ``uid`` (all rollout.n samples of one
+        prompt). Safety guards: keep the batch UNCHANGED if fewer than 2 informative
+        groups remain, or if the filtered size would break DP dispatch divisibility.
+        """
+        uids = batch.non_tensor_batch.get("uid")
+        n = len(batch)
+        noop_metrics = {"batch/zero_var_groups_frac": 0.0, "batch/filtered_frac": 0.0}
+        if uids is None or n == 0:
+            return batch, reward_tensor, reward_extra_infos_dict, noop_metrics
+
+        seq_rewards = reward_tensor.sum(dim=-1).float().cpu().numpy()
+        keep_mask = np.ones(n, dtype=bool)
+        n_groups = 0
+        n_zero_var = 0
+        for uid in dict.fromkeys(uids):  # preserve order, unique
+            idx = np.nonzero(uids == uid)[0]
+            n_groups += 1
+            if seq_rewards[idx].std() < 1e-6:
+                keep_mask[idx] = False
+                n_zero_var += 1
+
+        world_size = self.actor_rollout_wg.world_size
+        kept = int(keep_mask.sum())
+        fg_metrics = {
+            "batch/zero_var_groups_frac": n_zero_var / max(1, n_groups),
+            "batch/filtered_frac": (n - kept) / max(1, n),
+        }
+        # Guards: nothing to drop; too little signal left; or DP divisibility broken.
+        if n_zero_var == 0 or (n_groups - n_zero_var) < 2 or kept % world_size != 0:
+            if n_zero_var > 0:
+                print(
+                    f"[filter_groups] skipped: kept={kept}/{n} rows "
+                    f"({n_groups - n_zero_var}/{n_groups} informative groups, world_size={world_size})",
+                    flush=True,
+                )
+            fg_metrics["batch/filtered_frac"] = 0.0
+            return batch, reward_tensor, reward_extra_infos_dict, fg_metrics
+
+        idxs = np.nonzero(keep_mask)[0]
+        batch = batch.select_idxs(idxs)
+        reward_tensor = reward_tensor[torch.from_numpy(idxs)]
+        reward_extra_infos_dict = {k: [v[i] for i in idxs] for k, v in (reward_extra_infos_dict or {}).items()}
+        # Recompute meta that was derived from the pre-filter batch.
+        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+        if "multi_modal_inputs" in batch.non_tensor_batch:
+            images_seqlens_all = []
+            for mmi in batch.non_tensor_batch["multi_modal_inputs"]:
+                if "image_grid_thw" in mmi.keys():
+                    images_seqlens_all.extend(mmi["images_seqlens"].tolist())
+            batch.meta_info["images_seqlens"] = images_seqlens_all
+        print(
+            f"[filter_groups] dropped {n_zero_var}/{n_groups} zero-variance groups "
+            f"({n - kept}/{n} rows); batch is now {kept}",
+            flush=True,
+        )
+        return batch, reward_tensor, reward_extra_infos_dict, fg_metrics
+
+    # ------------------------------------------------------------------
+    # Specification gap: is the rubric this group trains on being hacked?
+    # ------------------------------------------------------------------
+    def _spec_gap_cfg(self) -> dict:
+        """Resolved spec-gap config, or {} when disabled (every caller short-circuits).
+
+        The referee's endpoint defaults to the VAL judge credentials, never the
+        train judge's: under SELF_JUDGE=1 the train judge is a frozen local model
+        of the policy's own family, and a referee that shares the train judge's
+        blind spots cannot detect a hack the two of them share.
+        """
+        from omegaconf import OmegaConf
+
+        se_cfg = OmegaConf.select(self.config, "data.self_evolving") or {}
+        if not bool(se_cfg.get("spec_gap", False)):
+            return {}
+        if getattr(self, "_spec_gap_dead", False):
+            return {}
+        rk = OmegaConf.select(self.config, "reward.custom_reward_function.reward_kwargs") or {}
+        cfg = {
+            "ship": bool(se_cfg.get("spec_gap_ship_exploits", False)),
+            "every": max(1, int(se_cfg.get("spec_gap_every_n_steps", 1) or 1)),
+            "score_key": str(se_cfg.get("spec_gap_score_key", "acc_raw_signed")),
+            "margin": float(se_cfg.get("spec_gap_margin", 0.05)),
+            "min_pairs": int(se_cfg.get("spec_gap_min_pairs", 3)),
+            "min_ranked": int(se_cfg.get("spec_gap_min_ranked", 3)),
+            "swap": bool(se_cfg.get("spec_gap_swap", True)),
+            "async_": bool(se_cfg.get("spec_gap_async", True)),
+            "deadline_s": float(se_cfg.get("spec_gap_deadline_s", 120)),
+            "answer_chars": int(se_cfg.get("spec_gap_answer_chars", 6000)),
+            "concurrency": int(se_cfg.get("spec_gap_concurrency", 16)),
+            "call_timeout_s": float(se_cfg.get("spec_gap_call_timeout_s", 90)),
+            "exploit_margin": float(se_cfg.get("spec_gap_exploit_margin", 0.15)),
+            # Ordering-disagreement fallback: for a measured group whose H exceeds
+            # this and where pick_exploit found no top-tier inversion, ship the
+            # widest stably-discordant pair instead. 1.0 disables.
+            "disagree_h": float(se_cfg.get("spec_gap_disagree_h", 0.5)),
+            "exploits_per_round": int(se_cfg.get("spec_gap_exploits_per_round", 8)),
+            "max_fail_steps": int(se_cfg.get("spec_gap_max_fail_steps", 3)),
+            "api_base": str(se_cfg.get("referee_api_base", "") or rk.get("val_api_base", "")),
+            "api_key": str(se_cfg.get("referee_api_key", "") or rk.get("val_api_key", "")),
+            "model_name": str(se_cfg.get("referee_model_name", "") or rk.get("val_model_name", "")),
+            "provider": str(se_cfg.get("referee_provider", "") or rk.get("val_provider", "")),
+        }
+        if not cfg["api_base"] or not cfg["model_name"]:
+            print("[spec_gap] no referee endpoint (referee_* or reward_kwargs.val_*); disabled",
+                  flush=True)
+            self._spec_gap_dead = True
+            return {}
+        if not getattr(self, "_spec_gap_logged", False):
+            self._spec_gap_logged = True
+            print(f"[spec_gap] ship={cfg['ship']} referee={cfg['model_name']} @ "
+                  f"{cfg['api_base']} provider={cfg['provider'] or 'env'} "
+                  f"margin={cfg['margin']}", flush=True)
+            if str(rk.get("model_name", "")) == cfg["model_name"]:
+                print("[spec_gap] WARNING: referee model == TRAIN judge model. Rubric-blindness "
+                      "still makes it an independent signal but not an independent model, so H is "
+                      "biased LOW by shared model bias. Bound it by re-grading the final val "
+                      "dumps under a second grader (scripts/self_evolving/rejudge_val.py).",
+                      flush=True)
+        return cfg
+
+    def _spec_gap_payload(self, batch: DataProto, reward_extra_infos_dict: dict, cfg: dict):
+        """Build the referee payload on the MAIN thread. Returns (payload, meta, metrics).
+
+        Everything handed to the worker is plain Python (str/float/int/list) —
+        never a DataProto, TensorDict or tokenizer — because the measurement runs
+        in a background thread while the main thread is mutating the batch with
+        old_log_prob / ref_log_prob.
+        """
+        from verl.utils.reward_score.healthbench_pro import _strip_thinking
+
+        src = reward_extra_infos_dict or {}
+        uids = batch.non_tensor_batch.get("uid")
+        if uids is None:
+            return [], {}, {}
+        uids = np.asarray(uids)
+        # Extras may be numpy arrays OR python lists here: the zero-variance
+        # filter rebuilds them as lists. Never `arr or default` — see _as_list.
+        scores = src.get(cfg["score_key"])
+        used_key = cfg["score_key"]
+        for alt in ("acc_raw", "score", "reward"):
+            if scores is None:
+                scores, used_key = src.get(alt), alt
+        if scores is None:
+            return [], {}, {}
+        scores = _as_list(scores)
+        think_closed = _as_list(src.get("think_closed"))
+        n = len(batch.batch)
+
+        payload, meta = [], {}
+        n_excluded = 0
+        for uid in dict.fromkeys(uids.tolist()):
+            idx = np.nonzero(uids == uid)[0]
+            rows = []
+            for i in idx:
+                i = int(i)
+                # Unclosed-think / empty answers sit at the reward FLOOR by
+                # construction (no judge call is even made), so pairs of
+                # (floor rollout, real answer) are almost always concordant and
+                # would INFLATE C, hiding real specification gaps. They are also
+                # a token-budget failure, not a specification failure.
+                if think_closed and i < len(think_closed) and float(think_closed[i]) <= 0.5:
+                    n_excluded += 1
+                    continue
+                rows.append(i)
+            if len(rows) < max(2, cfg["min_ranked"]):
+                continue
+            answers, lens, sc, item_results = {}, {}, {}, {}
+            keep = []
+            for i in rows:
+                data_item = batch[i]
+                plen = data_item.batch["prompts"].shape[-1]
+                valid = int(data_item.batch["attention_mask"][plen:].sum())
+                resp = self.tokenizer.decode(data_item.batch["responses"][:valid],
+                                             skip_special_tokens=True)
+                ans = _strip_thinking(resp)
+                if len(ans.strip()) < 32:
+                    n_excluded += 1
+                    continue
+                answers[i] = ans
+                lens[i] = len(ans)
+                sc[i] = float(scores[i]) if i < len(scores) else 0.0
+                keep.append(i)
+            if len(keep) < max(2, cfg["min_ranked"]):
+                continue
+            ex_info = batch[keep[0]].non_tensor_batch.get("extra_info", {}) or {}
+            task = _conversation_text_for_spec_gap(ex_info)
+            # An image task ranked from its text alone is ranked on prose: the
+            # referee cannot tell a correct reading of the study from a fluent wrong
+            # one. extra_info carries the paths precisely because the dataset drops
+            # the images column before this point.
+            _imgs = [im for im in (ex_info.get("images") or []) if isinstance(im, str)]
+            payload.append({"uid": str(uid), "task": task, "rows": keep,
+                            "answers": answers, "scores": sc, "lens": lens,
+                            "images": _imgs})
+            per_item = _as_list(src.get("rubric_met"))
+            for i in keep:
+                if per_item and i < len(per_item):
+                    try:
+                        item_results[i] = json.loads(per_item[i])
+                    except Exception:
+                        item_results[i] = []
+            meta[str(uid)] = {
+                "question_id": str(ex_info.get("question_id", "")),
+                "use_case": str(ex_info.get("use_case", "")),
+                "task": task, "answers": answers, "scores": sc,
+                "item_results": item_results,
+            }
+        metrics = {"spec_gap/excluded_unclosed_frac": (n_excluded / n) if n else 0.0}
+        if used_key != cfg["score_key"]:
+            print(f"[spec_gap] score key {cfg['score_key']!r} absent; using {used_key!r}",
+                  flush=True)
+        return payload, meta, metrics
+
+    def _submit_spec_gap(self, batch: DataProto, reward_extra_infos_dict: dict) -> None:
+        """Hook A: build the payload and start the referee (inline or on a thread).
+
+        Runs AFTER the zero-variance filter so no referee call is spent on a group
+        that is about to be dropped, and so there is a single indexing regime. The
+        two mechanisms are complementary, never in conflict: a zero-variance group
+        has no rubric ordering at all, so every pair is a rubric tie, H is
+        undefined and its weight stays 1.
+        """
+        self._spec_gap_result = None
+        cfg = self._spec_gap_cfg()
+        if not cfg or (self.global_steps % cfg["every"] != 0):
+            return
+        fut = getattr(self, "_spec_gap_future", None)
+        if fut is not None and not fut.done():
+            print("[spec_gap] previous step's referee still running; skipping this step",
+                  flush=True)
+            self._spec_gap_result = ({}, {}, {"spec_gap/skipped_busy": 1.0})
+            return
+        try:
+            payload, meta, metrics = self._spec_gap_payload(batch, reward_extra_infos_dict, cfg)
+        except Exception as e:  # noqa: BLE001 — never break training on measurement
+            import traceback
+            print(f"[spec_gap] payload build FAILED: {type(e).__name__}: {e}\n"
+                  f"{traceback.format_exc()}", flush=True)
+            return
+        if not payload:
+            self._spec_gap_result = ({}, meta, metrics)
+            return
+
+        def _work():
+            from verl.utils.reward_score.spec_gap import measure_groups_sync
+
+            return measure_groups_sync(
+                payload, cfg["api_base"], cfg["api_key"], cfg["model_name"],
+                provider=cfg["provider"], concurrency=cfg["concurrency"], swap=cfg["swap"],
+                margin=cfg["margin"], min_pairs=cfg["min_pairs"], step=int(self.global_steps),
+                answer_chars=cfg["answer_chars"], timeout_s=cfg["call_timeout_s"])
+
+        self._spec_gap_pending = (cfg, meta, metrics)
+        if not cfg["async_"]:
+            self._spec_gap_result = (self._run_spec_gap(_work), meta, metrics)
+            return
+        if getattr(self, "_spec_gap_executor", None) is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._spec_gap_executor = ThreadPoolExecutor(max_workers=1,
+                                                         thread_name_prefix="spec_gap")
+        self._spec_gap_future = self._spec_gap_executor.submit(self._run_spec_gap, _work)
+
+    def _run_spec_gap(self, work) -> dict:
+        """Referee call wrapper. Any failure degrades to measure-off, never raises."""
+        try:
+            return work()
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            print(f"[spec_gap] referee FAILED: {type(e).__name__}: {e}\n"
+                  f"{traceback.format_exc()}", flush=True)
+            return {}
+
+    def _record_spec_gap(self, batch: DataProto, reward_extra_infos_dict: dict) -> dict:
+        """Join the measurement, log it, and buffer the exploits it found.
+
+        Deliberately touches nothing the actor will train on. The repair happens in
+        the generation server, on the specification itself, before the solver sees it
+        again -- see verl/utils/reward_score/spec_gap.py for why down-weighting a
+        suspect group was implemented and then removed.
+        """
+        from verl.utils.reward_score.spec_gap import aggregate_stats, pick_exploit
+
+        pending = getattr(self, "_spec_gap_result", None)
+        cfg, meta, metrics = getattr(self, "_spec_gap_pending", (None, {}, {}))
+        if pending is not None:
+            stats, meta, metrics = pending
+        else:
+            fut = getattr(self, "_spec_gap_future", None)
+            if fut is None or cfg is None:
+                return {}
+            try:
+                stats = fut.result(timeout=cfg["deadline_s"])
+            except Exception as e:  # noqa: BLE001 — TimeoutError included
+                print(f"[spec_gap] join missed the {cfg['deadline_s']}s deadline "
+                      f"({type(e).__name__}); not measured this step", flush=True)
+                return {**metrics, "spec_gap/deadline_miss": 1.0}
+            finally:
+                self._spec_gap_future = None
+        self._spec_gap_result = None
+        if cfg is None:
+            return {}
+        if not stats:
+            n_fail = getattr(self, "_spec_gap_fail_steps", 0) + 1
+            self._spec_gap_fail_steps = n_fail
+            if n_fail >= cfg["max_fail_steps"]:
+                self._spec_gap_dead = True
+                print(f"[spec_gap] {n_fail} consecutive all-fail steps; DISABLED for this run",
+                      flush=True)
+                return {**metrics, "spec_gap/dead": 1.0}
+            return {**metrics, "spec_gap/referee/fail_frac": 1.0}
+        self._spec_gap_fail_steps = 0
+        self._spec_gap_n_groups = len(stats)
+        metrics = {**metrics, **aggregate_stats(stats)}
+
+        # Per-row extras -> the rollout jsonl (any key whose length matches the batch
+        # is dumped). Added AFTER the auto reward/<key>/mean loop, so these never
+        # become non_tensor_batch columns that ride into every actor worker.
+        uids = np.asarray(batch.non_tensor_batch["uid"])
+        if reward_extra_infos_dict is not None:
+            n = len(batch.batch)
+            row_h = np.full(n, np.nan)
+            row_meas = np.zeros(n)
+            row_tier = np.full(n, -1.0)
+            for uid, st in stats.items():
+                sel = uids == uid
+                if st.measured:
+                    row_h[sel] = st.h
+                    row_meas[sel] = 1.0
+                for i, t in st.tier_of.items():
+                    if 0 <= i < n:
+                        row_tier[i] = float(t)
+            for key, val in (("spec_gap_H", row_h), ("spec_gap_measured", row_meas),
+                             ("referee_tier", row_tier)):
+                reward_extra_infos_dict[key] = val.tolist()
+            if "uid" not in reward_extra_infos_dict:
+                reward_extra_infos_dict["uid"] = [str(u) for u in uids.tolist()]
+
+        # Confirmed exploits: the rollout the RUBRIC ranked top while the referee
+        # judged another better. Buffered across the steps between evolve rounds.
+        if cfg["ship"]:
+            from verl.utils.reward_score.spec_gap import pick_discordant
+
+            buf = getattr(self, "_spec_gap_exploits", None)
+            if buf is None:
+                buf = self._spec_gap_exploits = deque(maxlen=64)
+            found = n_disagree = 0
+            for uid, st in stats.items():
+                md = meta.get(uid) or {}
+                ex = pick_exploit(uid, st, md.get("scores", {}), md.get("answers", {}),
+                                  md.get("item_results", {}),
+                                  question_id=md.get("question_id", ""),
+                                  task=md.get("task", ""), use_case=md.get("use_case", ""),
+                                  exploit_margin=cfg["exploit_margin"],
+                                  step=int(self.global_steps))
+                # Ordering-disagreement fallback: the rubric's ordering mostly
+                # contradicts the referee (H > threshold) yet no top-tier inversion
+                # exists for pick_exploit to name. The widest stably-discordant pair
+                # is still a repairable contrast, and the patcher validates any
+                # minted criterion arithmetically before it touches the rubric — so
+                # a referee mistake here costs a rejected mint, not a bad patch.
+                if ex is None and st.measured and st.h is not None \
+                        and st.h > cfg["disagree_h"]:
+                    ex = pick_discordant(
+                        uid, st, md.get("scores", {}), md.get("answers", {}),
+                        md.get("item_results", {}),
+                        question_id=md.get("question_id", ""),
+                        task=md.get("task", ""), use_case=md.get("use_case", ""),
+                        min_gap=cfg["exploit_margin"], step=int(self.global_steps))
+                    if ex is not None:
+                        n_disagree += 1
+                if ex is not None:
+                    buf.append(ex)
+                    found += 1
+            metrics["spec_gap/exploits/found"] = float(found)
+            metrics["spec_gap/exploits/disagreements"] = float(n_disagree)
+            metrics["spec_gap/exploits/buffered"] = float(len(buf))
+        return metrics
+
+    def _maybe_ship_exploits(self, gen_server_url: str, se_cfg) -> dict:
+        """POST buffered exploit contrasts to /patch_spec. Never raises.
+
+        The buffer is drained ONLY on a 2xx: a failed POST must not destroy the
+        evidence, since a confirmed exploit costs a full step of rollouts to find.
+        Highest-H first, so if the round is capped the most-exploited
+        specifications are the ones that get repaired.
+        """
+        buf = getattr(self, "_spec_gap_exploits", None)
+        if not buf:
+            return {}
+        cfg = self._spec_gap_cfg()
+        if not cfg or not cfg["ship"]:
+            return {}
+        k = max(1, cfg["exploits_per_round"])
+        picked = sorted(buf, key=lambda e: -(e.get("H") or 0.0))[:k]
+        try:
+            import requests
+
+            r = requests.post(
+                f"{gen_server_url.rstrip('/')}/patch_spec",
+                json={"step": int(self.global_steps), "cases": picked,
+                      # groups graded at the last measurement, so the server can
+                      # report a hack RATE and not just a count
+                      "n_groups": int(getattr(self, "_spec_gap_n_groups", 0) or len(picked))},
+                timeout=float(se_cfg.get("patch_timeout", 900)),
+            )
+            r.raise_for_status()
+            res = r.json()
+            for e in picked:
+                try:
+                    buf.remove(e)
+                except ValueError:
+                    pass
+            print(f"[spec_gap] shipped {len(picked)} exploits -> /patch_spec: {res}", flush=True)
+            return {
+                "spec_gap/exploits/shipped": float(len(picked)),
+                "patch/minted": float(res.get("n_cases", 0)),
+                "patch/accepted": float(res.get("n_accepted", 0)),
+                "patch/mean_gap_drop": float(res.get("mean_gap_drop", 0.0) or 0.0),
+            }
+        except Exception as e:  # noqa: BLE001 — never break training on a patch failure
+            print(f"[spec_gap] /patch_spec FAILED, keeping {len(buf)} buffered: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            return {"spec_gap/exploits/shipped": 0.0}
+
+    def _maybe_evolve_solver_prompt(self, batch: DataProto, reward_extra_infos_dict: dict) -> dict:
+        """Optional end-of-step evolution of the SOLVER system prompt.
+
+        For fixed-dataset runs (MedThinkVQA), where there is no task generator to
+        evolve. Samples this step's rollouts -- gold answer, prediction, and the
+        reasoning that produced it -- and posts them to the gen server, which
+        rewrites the prompt the solver runs under.
+
+        Failure-heavy on purpose: a rewrite is only as good as the errors it is
+        shown, and correct rollouts say nothing about what to change. A few
+        correct ones are kept for contrast so the rewrite does not break what
+        already works.
+
+        Best-effort: any failure is logged and skipped, never raised.
+        """
+        from omegaconf import OmegaConf
+
+        se_cfg = OmegaConf.select(self.config, "data.self_evolving") or {}
+        if not bool(se_cfg.get("evolve_solver_prompt", False)):
+            return {}
+        gen_server_url = se_cfg.get("gen_server_url", "") or os.environ.get("GEN_SERVER_URL", "")
+        if not gen_server_url:
+            return {}
+        every = int(se_cfg.get("evolve_solver_every_n_steps", 5) or 5)
+        if every > 1 and (self.global_steps % every != 0):
+            return {}
+
+        def _say(msg: str) -> None:
+            print(f"[solver_prompt_evolution] step {self.global_steps}: {msg}", flush=True)
+
+        try:
+            import random as _random
+
+            import requests
+
+            src = reward_extra_infos_dict if reward_extra_infos_dict is not None else {}
+            acc = src.get("acc")
+            if acc is None:
+                _say("no per-sample acc in reward extras; skipping")
+                return {}
+            pred = src.get("extracted_answer")
+            n = len(batch)
+
+            def _at(seq, i, default=None):
+                try:
+                    return seq[i]
+                except (IndexError, TypeError, KeyError):
+                    return default
+
+            wrong = [i for i in range(n) if float(_at(acc, i, 0.0) or 0.0) < 0.5]
+            right = [i for i in range(n) if float(_at(acc, i, 0.0) or 0.0) >= 0.5]
+            k_bad = min(12, len(wrong))
+            k_ok = min(4, len(right))
+            picked = (_random.sample(wrong, k_bad) if k_bad else []) + \
+                     (_random.sample(right, k_ok) if k_ok else [])
+            if len(picked) < 4:
+                _say(f"only {len(picked)} usable rollouts; too few to diagnose, skipping")
+                return {}
+
+            cases = []
+            for i in picked:
+                item = batch[i]
+                prompt_ids = item.batch["prompts"]
+                plen = prompt_ids.shape[-1]
+                resp_ids = item.batch["responses"]
+                vlen = int(item.batch["attention_mask"][plen:].sum())
+                reasoning = self.tokenizer.decode(resp_ids[:vlen], skip_special_tokens=True)
+                ex = item.non_tensor_batch.get("extra_info", {}) or {}
+                rm = item.non_tensor_batch.get("reward_model", {}) or {}
+                cases.append({
+                    "gold": str(rm.get("ground_truth", "")),
+                    "predicted": str(_at(pred, i, "") or ""),
+                    "correct": float(_at(acc, i, 0.0) or 0.0) >= 0.5,
+                    "question": str(ex.get("question", ""))[:1500],
+                    "reasoning": reasoning[-2500:],
+                    "n_images": int(ex.get("n_images_used", 0) or 0),
+                })
+
+            from scripts.self_evolving.medthink_dataset import current_solver_prompt
+
+            path = se_cfg.get("solver_prompt_file", "") or os.environ.get(
+                "MTV_SOLVER_PROMPT_FILE", "")
+            cases[0]["current_prompt"] = current_solver_prompt(path, "")
+
+            val_score = getattr(self, "_last_val_score", None)
+            _say(f"posting {len(cases)} rollouts ({k_bad} wrong / {k_ok} right), "
+                 f"val={val_score} -> {gen_server_url}/evolve_solver")
+            r = requests.post(
+                f"{gen_server_url.rstrip('/')}/evolve_solver",
+                json={"step": int(self.global_steps), "cases": cases,
+                      "accuracy": val_score, "solver_prompt_file": path},
+                timeout=float(se_cfg.get("evolve_timeout", 600)),
+            )
+            r.raise_for_status()
+            res = r.json()
+            _say(f"done: {res}")
+            out = {"solver_evolution/changed": float(bool(res.get("changed"))),
+                   "solver_evolution/version": float(res.get("version", 0) or 0)}
+            for k in ("sample_acc", "n_unparsed"):
+                if res.get(k) is not None:
+                    out[f"solver_evolution/{k}"] = float(res[k])
+            return out
+        except Exception as e:  # noqa: BLE001 — never break training
+            import traceback
+
+            _say(f"FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            return {}
+
+    def _maybe_evolve_retrieval_reward(self, batch: DataProto, reward_extra_infos_dict: dict) -> dict:
+        """Optional end-of-step evolution of the RETRIEVAL reward (coverage judge).
+
+        Sends this step's SEARCHING rollouts — group id, coverage verdict, the
+        answer score, and the query plan — to the gen server, which measures how
+        well coverage ordering predicts answer ordering within a group and
+        rewrites the judge to sharpen it.
+
+        The answer score forwarded here is the PRE-BONUS one from the reward
+        manager: `_fold_retrieval_group_bonus` adds the coverage delta to the
+        reward tensor only, never to `reward_extra_infos_dict["score"]`. That
+        separation is what makes the concordance measurement meaningful — if the
+        judge's own bonus were inside the number it is scored against, a judge
+        could raise its measured quality just by being louder.
+
+        Best-effort: any failure is logged and skipped, never raised.
+        """
+        from omegaconf import OmegaConf
+
+        se_cfg = OmegaConf.select(self.config, "data.self_evolving") or {}
+        if not bool(se_cfg.get("evolve_retrieval_reward", False)):
+            return {}
+        gen_server_url = se_cfg.get("gen_server_url", "") or os.environ.get("GEN_SERVER_URL", "")
+        if not gen_server_url:
+            return {}
+        every = int(se_cfg.get("evolve_retrieval_every_n_steps", 5) or 5)
+        if every > 1 and (self.global_steps % every != 0):
+            return {}
+
+        def _say(msg: str) -> None:
+            print(f"[retrieval_reward_evolution] step {self.global_steps}: {msg}", flush=True)
+
+        try:
+            import requests
+
+            src = reward_extra_infos_dict if reward_extra_infos_dict is not None else {}
+            # NEVER use `or` to default these: the reward extras arrive as numpy
+            # ARRAYS (reward_loop builds them with np.array), and `arr or default`
+            # raises "truth value of an array is ambiguous" for any batch > 1.
+            # Since the whole hook is wrapped in a try/except, that would have made
+            # reward evolution a silent no-op for the entire run.
+            cov = src.get("retrieval_coverage")
+            if cov is None:
+                _say("no retrieval_coverage in reward extras; skipping")
+                return {}
+            judged = src.get("retrieval_judged")
+            used = src.get("retrieval_used")
+            scores = src.get("score")
+            if scores is None:
+                scores = src.get("reward")
+            if scores is None:
+                _say(f"no per-sample score in reward extras (keys={list(src.keys())[:12]}); skipping")
+                return {}
+            uids = batch.non_tensor_batch.get("uid")
+            if uids is None:
+                _say("no uid on the batch; cannot form groups, skipping")
+                return {}
+
+            def _at(seq, i, default=0.0):
+                try:
+                    return seq[i]
+                except (IndexError, TypeError, KeyError):
+                    return default
+
+            cases = []
+            for i in range(len(uids)):
+                if float(_at(used, i)) <= 0.5 or float(_at(judged, i)) <= 0.5:
+                    continue
+                ntb = batch[i].non_tensor_batch
+                ex = ntb.get("extra_info", {}) or {}
+                # The agent loop's fields arrive ONLY inside the `tool_extra_fields`
+                # object column — a top-level "search_queries" column never exists
+                # (the reward extras are a homogeneous all-float key set, so the
+                # query strings cannot travel that way).
+                tef = ntb.get("tool_extra_fields")
+                if not isinstance(tef, dict):
+                    tef = {}
+                q = tef.get("search_queries")
+                if isinstance(q, str):
+                    try:
+                        q = json.loads(q)
+                    except Exception:
+                        q = [q] if q.strip() else []
+                q = _as_list(q)
+                items = _as_list(ex.get("rubric_items"))
+                cases.append({
+                    "uid": str(uids[i]),
+                    "coverage": float(_at(cov, i)),
+                    "judged": True,
+                    "answer_score": float(_at(scores, i)),
+                    "queries": list(q)[:6],
+                    "task": str(ex.get("question", ""))[:600],
+                    "criteria": [str((it or {}).get("criterion_text")
+                                     or (it or {}).get("criterion") or "")[:140]
+                                 for it in items][:5],
+                })
+
+            if len(cases) < 4:
+                _say(f"only {len(cases)} judged searching rollouts; too few to measure, skipping")
+                return {}
+
+            # The server needs the prompt actually in force to edit it, and on the
+            # first round no file exists yet — send the defaults the reward is
+            # running on so v1 is an edit of the real prompt, not of "".
+            from verl.utils.reward_score.retrieval_coverage import current_coverage_prompt
+            cur_sys, cur_tpl, _v = current_coverage_prompt()
+            cases[0]["current_system"] = cur_sys
+            cases[0]["current_template"] = cur_tpl
+
+            _say(f"posting {len(cases)} searching rollouts -> {gen_server_url}/evolve_retrieval")
+            r = requests.post(
+                f"{gen_server_url.rstrip('/')}/evolve_retrieval",
+                json={"step": int(self.global_steps), "cases": cases},
+                timeout=float(se_cfg.get("evolve_timeout", 1200)),
+            )
+            r.raise_for_status()
+            res = r.json()
+            _say(f"done: {res}")
+            out = {"cov_evolution/changed": float(bool(res.get("changed"))),
+                   "cov_evolution/version": float(res.get("version", 0) or 0)}
+            for k in ("concordance", "within_group_spread", "coverage_sd",
+                      "n_ranked_pairs", "frac_one", "frac_zero"):
+                if res.get(k) is not None:
+                    out[f"cov_evolution/{k}"] = float(res[k])
+            return out
+        except Exception as e:  # noqa: BLE001 — never break training
+            import traceback
+
+            _say(f"FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            return {}
+
+    def _record_val_score(self, val_metrics: dict) -> None:
+        """Remember the headline held-out score for the generation-evolution loop.
+
+        Also stamps the step it was measured at. Evolution runs BEFORE validation
+        within a step, so what a round reports is the PREVIOUS evaluation — and
+        that evaluation was earned by the guidance version committed one evolve
+        interval earlier, not by the one about to be committed. The server needs
+        the step to credit it correctly; without it the whole delta chain shifts by
+        an interval and every rewrite is scored on its predecessor's result.
+        Falls back across metric names so a reward-manager rename cannot silently
+        turn the signal off; leaves the previous value in place if nothing matches.
+        """
+        for key in ("val-core/overall/acc/mean", "val-core/overall/acc_len_adj/mean"):
+            if key in val_metrics:
+                try:
+                    self._last_val_score = float(val_metrics[key])
+                    self._last_val_step = int(self.global_steps)
+                    return
+                except (TypeError, ValueError):
+                    pass
+        cand = [v for k, v in val_metrics.items()
+                if k.startswith("val-core/") and k.endswith("/acc/mean")]
+        if cand:
+            try:
+                self._last_val_score = float(sum(cand) / len(cand))
+                self._last_val_step = int(self.global_steps)
+            except (TypeError, ValueError):
+                pass
+
+    def _maybe_evolve_generation(self, batch: DataProto, reward_extra_infos_dict: dict) -> dict:
+        """Optional, training-only end-of-step GENERATION-prompt evolution (rubric mode).
+
+        Samples ~N of this step's rollouts — clinician task, model response, rubric,
+        which criteria were met, and the rubric score — and POSTs them to the gen
+        server's ``/evolve`` endpoint, which rewrites the proposer + task/rubric
+        generation prompts to target the capability gaps. Enabled via
+        ``data.self_evolving.evolve_generation``. Best-effort: any failure is logged
+        and skipped so it can never break training.
+        """
+        from omegaconf import OmegaConf
+
+        se_cfg = OmegaConf.select(self.config, "data.self_evolving") or {}
+        if not bool(se_cfg.get("evolve_generation", False)):
+            return {}
+        gen_server_url = se_cfg.get("gen_server_url", "") or os.environ.get("GEN_SERVER_URL", "")
+        if not gen_server_url:
+            return {}
+        every = int(se_cfg.get("evolve_every_n_steps", 1) or 1)
+        if every > 1 and (self.global_steps % every != 0):
+            return {}
+        num_examples = int(se_cfg.get("evolve_num_examples", 20) or 20)
+
+        def _say(msg: str) -> None:
+            print(f"[gen_evolution] step {self.global_steps}: {msg}", flush=True)
+
+        try:
+            import random as _random
+
+            import requests
+
+            from verl.utils.reward_score.healthbench_pro import _strip_thinking
+
+            n = len(batch)
+            if n == 0:
+                return {}
+            # Per-sample combined reward (for logging / picking) — same sources as reward evolution.
+            scores = None
+            per_item_met = None
+            for src in (reward_extra_infos_dict, batch.non_tensor_batch):
+                if src is not None and ("score" in src or "reward" in src):
+                    scores = src.get("score", src.get("reward"))
+                    per_item_met = src.get("rubric_met")
+                    break
+            scores = [float(s) for s in scores] if scores is not None else [0.0] * n
+
+            # Failure-weighted sampling: the evolver learns most from what went wrong,
+            # so send mostly the worst rollouts plus some best ones for contrast.
+            k = min(num_examples, n)
+            by_score = sorted(range(n), key=lambda i: scores[i] if i < len(scores) else 0.0)
+            n_low, n_high = (k + 1) // 2, k // 4
+            picked = by_score[:n_low] + (by_score[-n_high:] if n_high else [])
+            rest = [i for i in by_score[n_low: n - n_high if n_high else n]]
+            picked += _random.sample(rest, min(k - len(picked), len(rest)))
+            cases = []
+            for i in picked:
+                data_item = batch[i]
+                prompt_ids = data_item.batch["prompts"]
+                plen = prompt_ids.shape[-1]
+                resp_ids = data_item.batch["responses"]
+                valid_resp_len = int(data_item.batch["attention_mask"][plen:].sum())
+                resp_str = self.tokenizer.decode(resp_ids[:valid_resp_len], skip_special_tokens=True)
+                # The evolver must see what the GRADER saw: the final answer with the
+                # private reasoning channel stripped (sent in full — the analyzer has
+                # a long context; truncating here previously fed it reasoning-only
+                # excerpts and derailed the whole meta-loop).
+                answer_str = _strip_thinking(resp_str)
+                ex_info = data_item.non_tensor_batch.get("extra_info", {}) or {}
+                rubric_items = _as_list(ex_info.get("rubric_items"))
+                item_results = []
+                if per_item_met is not None and i < len(per_item_met):
+                    try:
+                        item_results = json.loads(per_item_met[i])
+                    except Exception:
+                        item_results = []
+                cases.append({
+                    # The server keys pool entries by question_id (that is what
+                    # /report's eviction uses), so a spec patch cannot find the
+                    # right rubric without it.
+                    "question_id": str(ex_info.get("question_id", "")),
+                    "use_case": ex_info.get("use_case", ""),
+                    "conversation": _as_list(ex_info.get("conversation")),
+                    "response": answer_str,
+                    "think_closed": "</think>" in resp_str.lower(),
+                    "think_chars": max(0, len(resp_str) - len(answer_str)),
+                    "rubric_items": list(rubric_items),
+                    "item_results": item_results,
+                    "total_score": scores[i] if i < len(scores) else 0.0,
+                })
+
+            # The most recent HELD-OUT validation score. The evolver's own train
+            # mean is the solver's score on tasks the curriculum wrote, so it
+            # rises whenever the curriculum gets easier; this is the only outcome
+            # signal it gets that cannot be gamed from inside the loop. None
+            # before the first validation, which the server renders as such.
+            val_score = getattr(self, "_last_val_score", None)
+            val_step = getattr(self, "_last_val_step", None)
+            _say(f"posting {len(cases)} cases (val={val_score}@step{val_step}) "
+                 f"-> {gen_server_url}/evolve")
+            r = requests.post(
+                f"{gen_server_url.rstrip('/')}/evolve",
+                json={"step": int(self.global_steps), "cases": cases,
+                      "val_score": val_score, "val_step": val_step},
+                timeout=float(se_cfg.get("evolve_timeout", 1200)),
+            )
+            r.raise_for_status()
+            res = r.json()
+            _say(f"done: {res}")
+            out = {
+                "gen_evolution/n_cases": float(res.get("n_cases", 0)),
+                "gen_evolution/mean_score": float(res.get("mean_score", 0.0)),
+                "gen_evolution/changed_query_guidance": float(bool(res.get("changed_query_guidance"))),
+                "gen_evolution/changed_generator_guidance": float(bool(res.get("changed_generator_guidance"))),
+            }
+            out.update(self._maybe_ship_exploits(gen_server_url, se_cfg))
+            return out
+        except Exception as e:  # noqa: BLE001 — never break training on evolution failure
+            import traceback
+
+            _say(f"FAILED: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            return {}
+
+    def _validate(self, merged: bool = False):
+        data_source_lst = []
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+
+        # Lists to collect samples for the table
+        sample_inputs = []
+        sample_outputs = []
+        sample_gts = []
+        sample_scores = []
+        sample_turns = []
+        sample_uids = []
+
+        val_pbar = tqdm(
+            self.val_dataloader,
+            total=len(self.val_dataloader),
+            desc=f"Validation (step {self.global_steps}, {len(self.val_dataloader.dataset)} prompts)",
+        )
+        for test_data in val_pbar:
+            test_batch = DataProto.from_single_dict(test_data)
+
+            if "uid" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                )
+
+            # repeat test batch
+            test_batch = test_batch.repeat(
+                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+            )
+
+            ground_truths = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+            ]
+            sample_gts.extend(ground_truths)
+
+            test_gen_batch = self._get_gen_batch(test_batch)
+            test_gen_batch.meta_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "validate": True,
+                "global_steps": self.global_steps,
+            }
+
+            # pad to be divisible by dp_size
+            size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+
+            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+                # for colocate reward models, we need to sleep rollout model
+                # to spare GPU memory for reward model
+                self.checkpoint_manager.sleep_replicas()
+                # Mark this batch as validation so the reward fn uses the composite (non-evolve)
+                # path: the evolvable function never runs on val and the judge prompt stays
+                # static, keeping val metrics comparable across steps.
+                test_output_gen_batch_padded.meta_info["validate"] = True
+                batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
+                test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
+                # wake up rollout model
+                # replace with wake_up method once supported
+                self.checkpoint_manager.update_weights(self.global_steps)
+
+            # unpad
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+
+            # Store generated outputs
+            output_ids = test_output_gen_batch.batch["responses"]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            sample_outputs.extend(output_texts)
+
+            test_batch = test_batch.union(test_output_gen_batch)
+            test_batch.meta_info["validate"] = True
+
+            # Store original inputs
+            input_ids = test_batch.batch["prompts"]
+            # TODO: Can we keep special tokens except for padding tokens?
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            sample_inputs.extend(input_texts)
+            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
+            # evaluate using reward_function
+            reward_tensor, reward_extra_info = extract_reward(test_batch)
+
+            scores = reward_tensor.sum(-1).cpu().tolist()
+            sample_scores.extend(scores)
+
+            reward_extra_infos_dict["reward"].extend(scores)
+            for key, values in reward_extra_info.items():
+                if key not in reward_extra_infos_dict:
+                    reward_extra_infos_dict[key] = []
+                if isinstance(values, np.ndarray):
+                    reward_extra_infos_dict[key].extend(values.tolist())
+                else:
+                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+
+            # collect num_turns of each prompt
+            if "__num_turns__" in test_batch.non_tensor_batch:
+                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+
+            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        # dump generations
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if val_data_dir:
+            self._dump_generations(
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                gts=sample_gts,
+                scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=val_data_dir,
+            )
+
+        # Carry ground truths alongside the reward extras so the CLIMB metric
+        # reducer (per-modality class-macro F1) can run inside
+        # _val_metrics_update for both the merged and non-merged paths. It is a
+        # string column, so process_validation_metrics ignores it for means.
+        if sample_gts and len(sample_gts) == len(sample_scores):
+            reward_extra_infos_dict["climb_gt"] = list(sample_gts)
+
+        for key_info, lst in reward_extra_infos_dict.items():
+            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+
+        if merged:
+            print("_merge_validation_results validate result will be merged")
+            return {
+                "data_sources": data_source_lst,
+                "sample_uids": sample_uids,
+                "sample_turns": sample_turns,
+                "reward_extra_infos_dict": reward_extra_infos_dict,
+            }
+        data_sources = np.concatenate(data_source_lst, axis=0)
+        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+
+    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        metric_dict = {}
+        for data_source, var2metric2val in data_src2var2metric2val.items():
+            core_var = "acc" if "acc" in var2metric2val else "reward"
+            for var_name, metric2val in var2metric2val.items():
+                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                for metric_name, metric_val in metric2val.items():
+                    if (
+                        (var_name == core_var)
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and (f"@{n_max}" in metric_name)
+                    ):
+                        metric_sec = "val-core"
+                    else:
+                        metric_sec = "val-aux"
+                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                    metric_dict[pfx] = metric_val
+
+        # Overall (micro-average) accuracy across ALL validation samples, regardless of
+        # data_source — the single headline number. mimic_rare splits the val set into many
+        # per-ICD-category data_sources, so the per-source means above don't give one overall
+        # figure. `acc` is the exact-match accuracy the composite reward computes per sample.
+        for _var in ("acc", "reward"):
+            _vals = reward_extra_infos_dict.get(_var)
+            if _vals is not None and len(_vals) > 0:
+                _arr = np.asarray(_vals, dtype=np.float64)
+                _arr = _arr[np.isfinite(_arr)]
+                if _arr.size:
+                    metric_dict[f"val-core/overall/{_var}/mean"] = float(_arr.mean())
+
+        if len(sample_turns) > 0:
+            sample_turns = np.concatenate(sample_turns)
+            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
+            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
+            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        # CLIMB: per-modality class-macro F1 + macro-average across modalities.
+        # verl's per-data_source mean already yields per-modality accuracy
+        # (acc/mean@N); this adds the F1 the mean-based path cannot compute.
+        preds = reward_extra_infos_dict.get("extracted_answer", [])
+        gts = reward_extra_infos_dict.get("climb_gt", [])
+        if preds and gts:
+            try:
+                from verl.trainer.ppo.climb_metrics import compute_climb_modality_metrics
+
+                metric_dict.update(
+                    compute_climb_modality_metrics(list(data_sources), list(preds), list(gts))
+                )
+            except Exception as e:  # never let metric add-ons break validation
+                print(f"[climb] modality metric computation failed: {type(e).__name__}: {e}")
+
+        return metric_dict
+
+    def _merge_validation_results(self, result_a, result_b):
+        if result_a is None and result_b is None:
+            return {}
+        if result_a is None:
+            result_a = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+        if result_b is None:
+            result_b = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+
+        if not result_a.get("data_sources") and not result_b.get("data_sources"):
+            return {}
+
+        data_sources = np.concatenate(result_a["data_sources"] + result_b["data_sources"], axis=0)
+        sample_uids = result_a["sample_uids"] + result_b["sample_uids"]
+        sample_turns = result_a["sample_turns"] + result_b["sample_turns"]
+
+        reward_extra_infos_dict = {}
+        all_keys = set(result_a["reward_extra_infos_dict"].keys()) | set(result_b["reward_extra_infos_dict"].keys())
+        for key in all_keys:
+            list_a = result_a["reward_extra_infos_dict"].get(key, [])
+            list_b = result_b["reward_extra_infos_dict"].get(key, [])
+            reward_extra_infos_dict[key] = list_a + list_b
+
+        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+
+    def init_workers(self):
+        """Initialize distributed training workers using Ray backend.
+
+        Creates:
+        1. Ray resource pools from configuration
+        2. Worker groups for each role (actor, critic, etc.)
+        """
+        self.resource_pool_manager.create_resource_pool()
+
+        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+
+        # create actor and rollout
+        actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        if self.hybrid_engine:
+            actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+            actor_rollout_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[actor_role],
+                config=self.config.actor_rollout_ref,
+                distillation_config=self.config.get("distillation"),
+                role=str(actor_role),
+            )
+            self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
+        else:
+            raise NotImplementedError
+
+        # create critic
+        if self.use_critic:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+
+            from verl.workers.config import CriticConfig
+
+            critic_cfg: CriticConfig = omega_conf_to_dataclass(self.config.critic)
+
+            # convert critic_cfg into TrainingWorkerConfig for the unified model engine worker
+            from verl.workers.engine_workers import TrainingWorkerConfig
+
+            orig_critic_cfg = critic_cfg
+            engine_config: EngineConfig = orig_critic_cfg.engine
+            engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
+            engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
+
+            critic_cfg = TrainingWorkerConfig(
+                model_type="value_model",
+                model_config=orig_critic_cfg.model,
+                engine_config=engine_config,
+                optimizer_config=orig_critic_cfg.optim,
+                checkpoint_config=orig_critic_cfg.checkpoint,
+                extra_context=getattr(self, "_critic_extra_context", {}),
+            )
+
+            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
+            self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
+
+        # create reference policy if needed
+        if self.use_reference_policy and Role.RefPolicy in self.role_worker_mapping:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            ref_policy_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.RefPolicy],
+                config=self.config.actor_rollout_ref,
+                role=str(Role.RefPolicy),
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
+
+        # initialize WorkerGroup
+        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
+        # you should not use `create_colocated_worker_cls`.
+        # Instead, directly pass different resource pool to different worker groups.
+        # See https://github.com/verl-project/verl/blob/master/examples/tutorial/ray/tutorial.ipynb
+        # for more information.
+        all_wg = {}
+        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+            # Only require nsight worker options when tool is nsys
+            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
+                assert (
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    is not None
+                ), "worker_nsight_options must be set when using nsys with profile_steps"
+                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                )
+        wg_kwargs["device_name"] = self.device_name
+
+        for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            if not class_dict:
+                continue
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            wg_dict = self.ray_worker_group_cls(
+                resource_pool=resource_pool,
+                ray_cls_with_init=worker_dict_cls,
+                **wg_kwargs,
+            )
+            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            all_wg.update(spawn_wg)
+
+        if self.use_critic:
+            self.critic_wg = all_wg[str(Role.Critic)]
+            self.critic_wg.reset()
+            # assign critic loss
+            from functools import partial
+
+            from verl.workers.utils.losses import value_loss
+
+            value_loss_ = partial(value_loss, config=orig_critic_cfg)
+            self.critic_wg.set_loss_fn(value_loss_)
+
+        if self.use_reference_policy and not self.ref_in_actor:
+            if str(Role.RefPolicy) in all_wg:
+                self.ref_policy_wg = all_wg[str(Role.RefPolicy)]
+                self.ref_policy_wg.init_model()
+            else:
+                # Model engine: ActorRolloutRefWorker
+                assert str(Role.ActorRolloutRef) in all_wg, f"{all_wg.keys()=}"
+                self.ref_policy_wg = all_wg[str(Role.ActorRolloutRef)]
+
+        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
+        self.actor_rollout_wg = all_wg[str(actor_role)]
+        self.actor_rollout_wg.init_model()
+
+        if self.ref_in_actor:
+            self.ref_policy_wg = self.actor_rollout_wg
+
+        # create reward loop manager
+        from verl.experimental.reward_loop import RewardLoopManager
+
+        # initalize reward loop manager
+        # reward model (colocate or standalone): get resource_pool
+        # no reward model: resource_pool = None
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel) if self.use_rm else None
+        self.reward_loop_manager = RewardLoopManager(
+            config=self.config,
+            rm_resource_pool=resource_pool,
+        )
+
+        # create async rollout manager and request scheduler
+        # Note: mode is always "async" since sync mode is deprecated
+        self.async_rollout_mode = True
+
+        # initialize teacher loop manager
+        if self.use_teacher_policy:
+            from verl.experimental.teacher_loop import MultiTeacherModelManager
+
+            # External teachers don't reserve a Ray pool; pass None so the manager
+            # only routes via HTTP.
+            teacher_resource_pool = (
+                None
+                if Role.TeacherModel not in self.resource_pool_manager.mapping
+                else self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            )
+            self.teacher_model_manager = MultiTeacherModelManager(
+                config=self.config,
+                resource_pool=teacher_resource_pool,
+            )
+            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+        else:
+            self.teacher_model_manager = None
+            self.distillation_config = None
+
+        # Support custom AgentLoopManager via config
+        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
+        if manager_class_fqn:
+            AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+        else:
+            from verl.experimental.agent_loop import AgentLoopManager
+
+        # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
+        # agent_reward_loop: streaming reward computation with actor rollout
+        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
+        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+
+        self.llm_server_manager = LLMServerManager.create(
+            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
+        )
+
+        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
+        # to stream reward computation with actor rollout
+        # To stream teacher computation with actor rollout, we instead pass the full manager so that the
+        # teacher loop workers can sleep/wake together with rollout workers
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+        self.async_rollout_manager = AgentLoopManager.create(
+            config=self.config,
+            llm_client=self.llm_server_manager.get_client(),
+            teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
+            reward_loop_worker_handles=reward_loop_worker_handles,
+        )
+
+        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        # Support custom CheckpointEngineManager via config
+        checkpoint_manager_class_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
+        if checkpoint_manager_class_fqn:
+            CheckpointEngineManager = load_class_from_fqn(checkpoint_manager_class_fqn, "CheckpointEngineManager")
+        else:
+            from verl.checkpoint_engine import CheckpointEngineManager
+        self.checkpoint_manager = CheckpointEngineManager(
+            config=checkpoint_engine_config,
+            trainer=self.actor_rollout_wg,
+            replicas=self.llm_server_manager.get_replicas(),
+        )
+
+        # sleep all replicas to load checkpoint
+        self.checkpoint_manager.sleep_replicas()
+
+    def _save_checkpoint(self):
+        from verl.utils.fs import local_mkdir_safe
+
+        # path: given_path + `/global_step_{global_steps}` + `/actor`
+        local_global_step_folder = os.path.join(
+            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
+        )
+
+        print(f"local_global_step_folder: {local_global_step_folder}")
+        actor_local_path = os.path.join(local_global_step_folder, "actor")
+
+        actor_remote_path = (
+            None
+            if self.config.trainer.default_hdfs_dir is None
+            else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
+        )
+
+        remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
+        if remove_previous_ckpt_in_save:
+            print(
+                "Warning: remove_previous_ckpt_in_save is deprecated,"
+                + " set max_actor_ckpt_to_keep=1 and max_critic_ckpt_to_keep=1 instead"
+            )
+        max_actor_ckpt_to_keep = (
+            self.config.trainer.get("max_actor_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
+        )
+        max_critic_ckpt_to_keep = (
+            self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
+        )
+
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+        )
+
+        if self.use_critic:
+            critic_local_path = os.path.join(local_global_step_folder, str(Role.Critic))
+            critic_remote_path = (
+                None
+                if self.config.trainer.default_hdfs_dir is None
+                else os.path.join(
+                    self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", str(Role.Critic)
+                )
+            )
+            self.critic_wg.save_checkpoint(
+                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+            )
+
+        # save dataloader
+        local_mkdir_safe(local_global_step_folder)
+        dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
+        dataloader_state_dict = self.train_dataloader.state_dict()
+        torch.save(dataloader_state_dict, dataloader_local_path)
+
+        # latest checkpointed iteration tracker (for atomic usage)
+        if (
+            hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
+            and self.config.actor_rollout_ref.actor.checkpoint.async_save
+        ) or (
+            "async_save" in self.config.actor_rollout_ref.actor.checkpoint
+            and self.config.actor_rollout_ref.actor.checkpoint["async_save"]
+        ):
+            print("skip write latest_checkpointed_iteration.txt when async_save is True")
+            return
+        local_latest_checkpointed_iteration = os.path.join(
+            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
+        )
+        with open(local_latest_checkpointed_iteration, "w") as f:
+            f.write(str(self.global_steps))
+
+    def _load_checkpoint(self):
+        if self.config.trainer.resume_mode == "disable":
+            return 0
+
+        # load from hdfs
+        if self.config.trainer.default_hdfs_dir is not None:
+            raise NotImplementedError("load from hdfs is not implemented yet")
+        else:
+            checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
+            if not os.path.isabs(checkpoint_folder):
+                working_dir = os.getcwd()
+                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
+            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+
+        # find global_step_folder
+        if self.config.trainer.resume_mode == "auto":
+            if global_step_folder is None:
+                print("Training from scratch")
+                return 0
+        else:
+            if self.config.trainer.resume_mode == "resume_path":
+                assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
+                assert "global_step_" in self.config.trainer.resume_from_path, (
+                    "resume ckpt must specify the global_steps"
+                )
+                global_step_folder = self.config.trainer.resume_from_path
+                if not os.path.isabs(global_step_folder):
+                    working_dir = os.getcwd()
+                    global_step_folder = os.path.join(working_dir, global_step_folder)
+        print(f"Load from checkpoint folder: {global_step_folder}")
+        # set global step
+        self.global_steps = int(global_step_folder.split("global_step_")[-1])
+
+        print(f"Setting global step to {self.global_steps}")
+        print(f"Resuming from {global_step_folder}")
+
+        actor_path = os.path.join(global_step_folder, "actor")
+        critic_path = os.path.join(global_step_folder, str(Role.Critic))
+        # load actor
+        self.actor_rollout_wg.load_checkpoint(
+            actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+        )
+        # load critic
+        if self.use_critic:
+            self.critic_wg.load_checkpoint(
+                critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+            )
+
+        # load dataloader,
+        # TODO: from remote not implemented yet
+        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
+        if os.path.exists(dataloader_local_path):
+            steps_per_epoch = len(self.train_dataloader)
+            at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
+            if at_epoch_boundary:
+                print(
+                    f"Skipping dataloader state restore: global_steps={self.global_steps} "
+                    f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "
+                    f"The saved state marks the dataloader as exhausted. "
+                    f"Next epoch will iterate from scratch."
+                )
+            else:
+                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                self.train_dataloader.load_state_dict(dataloader_state_dict)
+        else:
+            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+    def _start_profiling(self, do_profile: bool) -> None:
+        """Start profiling for all worker groups if profiling is enabled."""
+        if do_profile:
+            self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
+            if self.use_reference_policy:
+                self.ref_policy_wg.start_profile(profile_step=self.global_steps)
+            if self.use_critic:
+                self.critic_wg.start_profile(profile_step=self.global_steps)
+
+    def _stop_profiling(self, do_profile: bool) -> None:
+        """Stop profiling for all worker groups if profiling is enabled."""
+        if do_profile:
+            self.actor_rollout_wg.stop_profile()
+            if self.use_reference_policy:
+                self.ref_policy_wg.stop_profile()
+            if self.use_critic:
+                self.critic_wg.stop_profile()
+
+    def _get_dp_size(self, worker_group, role: str) -> int:
+        """Get data parallel size from worker group dispatch info.
+
+        This method retrieves the data parallel size by querying the dispatch info
+        for the specified role. The dispatch info is cached for subsequent calls.
+
+        Args:
+            worker_group: The worker group to query dispatch info from.
+            role: The role name (e.g., "actor", "critic") to get DP size for.
+
+        Returns:
+            The data parallel size (number of DP ranks).
+        """
+        if role not in worker_group._dispatch_info:
+            dp_rank_mapping = worker_group._query_dispatch_info(role)
+            worker_group._dispatch_info[role] = dp_rank_mapping
+        else:
+            dp_rank_mapping = worker_group._dispatch_info[role]
+        return max(dp_rank_mapping) + 1
+
+    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+        """Reorder the data on single controller such that each dp rank gets similar total tokens.
+
+        When use_prefix_grouper is enabled, uses group-level balancing to keep samples with
+        the same uid together on the same rank for prefix sharing optimization.
+        """
+        attention_mask = batch.batch["attention_mask"]
+        batch_size = attention_mask.shape[0]
+        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
+        workload_lst = calculate_workload(global_seqlen_lst)
+        # Get dp_size from dispatch info to correctly balance across data parallel ranks
+        # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+
+        # Use group-level balancing for PrefixGrouper to keep same-uid samples together
+        if getattr(self, "use_prefix_grouper", False) and "uid" in batch.non_tensor_batch:
+            from verl.utils.seqlen_balancing import get_group_balanced_partitions
+
+            uid_list = list(batch.non_tensor_batch["uid"])
+            seqlen_list = global_seqlen_lst.tolist()
+
+            # Count number of uid groups
+            num_groups = len(set(uid_list))
+
+            if num_groups % dp_size != 0:
+                raise ValueError(
+                    f"PrefixGrouper with balance_batch requires num_uid_groups ({num_groups}) "
+                    f"% dp_size ({dp_size}) == 0. "
+                    f"This ensures each rank gets equal number of groups. "
+                    f"Current batch_size={batch_size}, adjust batch_size to be a multiple of "
+                    f"dp_size * rollout.n."
+                )
+
+            global_partition_lst = get_group_balanced_partitions(
+                seqlen_list=seqlen_list,
+                uid_list=uid_list,
+                k_partitions=dp_size,
+            )
+
+        elif keep_minibatch:
+            # Decouple the DP balancing and mini-batching.
+            minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
+            minibatch_num = len(workload_lst) // minibatch_size
+            global_partition_lst = [[] for _ in range(dp_size)]
+            for i in range(minibatch_num):
+                rearrange_minibatch_lst = get_seqlen_balanced_partitions(
+                    workload_lst[i * minibatch_size : (i + 1) * minibatch_size],
+                    k_partitions=dp_size,
+                    equal_size=True,
+                )
+                for j, part in enumerate(rearrange_minibatch_lst):
+                    global_partition_lst[j].extend([x + minibatch_size * i for x in part])
+        else:
+            global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
+        # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
+        # Skip reordering within partitions for PrefixGrouper to maintain uid grouping
+        if not getattr(self, "use_prefix_grouper", False):
+            for idx, partition in enumerate(global_partition_lst):
+                partition.sort(key=lambda x: (workload_lst[x], x))
+                ordered_partition = partition[::2] + partition[1::2][::-1]
+                global_partition_lst[idx] = ordered_partition
+
+        # reorder based on index. The data will be automatically equally partitioned by dispatch function
+        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        batch.reorder(global_idx)
+        global_balance_stats = log_seqlen_unbalance(
+            seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
+        )
+        metrics.update(global_balance_stats)
+
+    def _compute_values(self, batch: DataProto) -> DataProto:
+        batch_td = batch.to_tensordict()
+        # step 2: convert from padding to nopadding
+        batch_td = left_right_2_no_padding(batch_td)
+        # step 3: add meta info
+        tu.assign_non_tensor(batch_td, compute_loss=False)
+        output = self.critic_wg.infer_batch(batch_td)
+        output = output.get()
+        values = tu.get(output, "values")
+        values = no_padding_2_padding(values, batch_td)
+        values = tu.get_tensordict({"values": values.float()})
+        values = DataProto.from_tensordict(values)
+        return values
+
+    def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+        # step 1: convert dataproto to tensordict.
+        batch_td = batch.to_tensordict()
+        # step 2: convert from padding to nopadding
+        batch_td = left_right_2_no_padding(batch_td)
+        # step 3: add meta info
+        metadata = {"calculate_entropy": False, "compute_loss": False}
+        if self.ref_in_actor:
+            metadata["no_lora_adapter"] = True
+        tu.assign_non_tensor(batch_td, **metadata)
+        if self.ref_in_actor:
+            output = self.actor_rollout_wg.compute_log_prob(batch_td)
+        else:
+            output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
+        # gather output
+        log_probs = tu.get(output, "log_probs")
+        # step 4. No padding to padding
+        log_probs = no_padding_2_padding(log_probs, batch_td)
+        # step 5: rebuild a tensordict and convert to dataproto
+        ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
+        ref_log_prob = DataProto.from_tensordict(ref_log_prob)
+
+        return ref_log_prob
+
+    def _compute_old_log_prob(self, batch: DataProto):
+        # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
+        # step 1: convert dataproto to tensordict.
+        batch_td = batch.to_tensordict()
+        # step 2: convert from padding to nopadding
+        batch_td = left_right_2_no_padding(batch_td)
+        # step 3: add meta info
+        calculate_sum_pi_squared = self.config.actor_rollout_ref.actor.get("calculate_sum_pi_squared", False)
+        tu.assign_non_tensor(
+            batch_td,
+            calculate_entropy=True,
+            calculate_sum_pi_squared=calculate_sum_pi_squared,
+            compute_loss=False,
+        )
+        output = self.actor_rollout_wg.compute_log_prob(batch_td)
+        # gather output
+        entropy = tu.get(output, "entropy")
+        log_probs = tu.get(output, "log_probs")
+        routed_experts = tu.get(output, "routed_experts")
+        sum_pi_squared = tu.get(output, "sum_pi_squared") if calculate_sum_pi_squared else None
+
+        old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
+        # step 4. No padding to padding
+        entropy = no_padding_2_padding(entropy, batch_td)
+        log_probs = no_padding_2_padding(log_probs, batch_td)
+        if sum_pi_squared is not None:
+            sum_pi_squared = no_padding_2_padding(sum_pi_squared, batch_td)
+        # step 5: rebuild a tensordict and convert to dataproto
+        result = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
+        if routed_experts is not None:
+            result["routed_experts"] = routed_experts
+        if sum_pi_squared is not None:
+            result["sum_pi_squared"] = sum_pi_squared.float()
+        old_log_prob = tu.get_tensordict(result)
+        old_log_prob = DataProto.from_tensordict(old_log_prob)
+        return old_log_prob, old_log_prob_mfu
+
+    def _update_actor(self, batch: DataProto) -> DataProto:
+        rollout_config = self.config.actor_rollout_ref.rollout
+        batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
+        # TODO: Make "temperature" single source of truth from generation.
+        batch.meta_info["temperature"] = rollout_config.temperature
+        # update actor
+        batch_td = batch.to_tensordict()
+        # step 2: convert from padding to no-padding
+        batch_td = left_right_2_no_padding(batch_td)
+        calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
+            self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+        )
+        distillation_use_topk = (
+            self.distillation_config.distillation_loss.loss_settings.use_topk
+            if is_distillation_enabled(self.config.get("distillation"))
+            else False
+        )
+        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        # The batch may be smaller than configured (trainer.filter_zero_variance_groups
+        # drops whole GRPO groups). Keep the configured NUMBER of PPO minibatches and
+        # scale the minibatch size to the actual rows so the engine's divisibility
+        # asserts (per-dp rows % per-gpu minibatch == 0) hold; fall back to a single
+        # minibatch when no divisible split exists. Without this, a filtered batch
+        # crashes update_actor (e.g. "124 % 64 != 0" at v4 step 19).
+        expected_rows = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+        actual_rows = len(batch)
+        if actual_rows != expected_rows and actual_rows > 0:
+            dp_size = self.actor_rollout_wg.world_size
+            num_mini = max(1, expected_rows // max(1, ppo_mini_batch_size))
+            if actual_rows % num_mini == 0 and (actual_rows // num_mini) % dp_size == 0:
+                ppo_mini_batch_size = actual_rows // num_mini
+            else:
+                ppo_mini_batch_size = actual_rows
+            print(
+                f"[filter_groups] update_actor: batch {actual_rows} != configured {expected_rows}; "
+                f"minibatch size scaled to {ppo_mini_batch_size}",
+                flush=True,
+            )
+        ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
+        seed = self.config.actor_rollout_ref.actor.data_loader_seed
+        shuffle = self.config.actor_rollout_ref.actor.shuffle
+        tu.assign_non_tensor(
+            batch_td,
+            calculate_entropy=calculate_entropy,
+            distillation_use_topk=distillation_use_topk,
+            global_batch_size=ppo_mini_batch_size,
+            mini_batch_size=ppo_mini_batch_size,
+            epochs=ppo_epochs,
+            seed=seed,
+            dataloader_kwargs={"shuffle": shuffle},
+            compute_loss=True,
+        )
+        actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        actor_output = tu.get(actor_output, "metrics")
+        actor_output = rename_dict(actor_output, "actor/")
+        # modify key name
+        actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
+        actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
+
+        return actor_output
+
+    def _update_critic(self, batch: DataProto) -> DataProto:
+        batch_td = batch.to_tensordict()
+        # step 2: convert from padding to no-padding
+        batch_td = left_right_2_no_padding(batch_td)
+        ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
+        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        ppo_epochs = self.config.critic.ppo_epochs
+        seed = self.config.critic.data_loader_seed
+        shuffle = self.config.critic.shuffle
+        tu.assign_non_tensor(
+            batch_td,
+            global_batch_size=ppo_mini_batch_size,
+            mini_batch_size=ppo_mini_batch_size,
+            epochs=ppo_epochs,
+            seed=seed,
+            dataloader_kwargs={"shuffle": shuffle},
+        )
+
+        output = self.critic_wg.train_mini_batch(batch_td)
+        output = output.get()
+        output = tu.get(output, "metrics")
+        output = rename_dict(output, "critic/")
+        # modify key name
+        output["perf/mfu/critic"] = output.pop("critic/mfu")
+        critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
+        return critic_output
+
+    def fit(self):
+        """
+        The training loop of PPO.
+        The driver process only need to call the compute functions of the worker group through RPC
+        to construct the PPO dataflow.
+        The light-weight advantage computation is done on the driver process.
+        """
+        if self._dump_executor._shutdown:
+            self._init_dump_executor()
+
+        from omegaconf import OmegaConf
+
+        from verl.utils.tracking import Tracking
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        self.global_steps = 0
+
+        # load checkpoint and update weights before doing anything
+        self._load_checkpoint()
+        self.checkpoint_manager.update_weights(self.global_steps)
+
+        current_epoch = self.global_steps // len(self.train_dataloader)
+
+        SkipManager.init(self.config)
+
+        # perform validation before training
+        # currently, we only support validation using the reward_function.
+        if self.config.trainer.get("val_before_train", True):
+            val_metrics = self._validate()
+            assert val_metrics, f"{val_metrics=}"
+            self._record_val_score(val_metrics)
+            pprint(f"Initial validation metrics: {val_metrics}")
+            logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get("val_only", False):
+                self._shutdown_dump_executor()
+                return
+
+        # add tqdm
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+        # we start from step 1
+        self.global_steps += 1
+        last_val_metrics = None
+        self.max_steps_duration = 0
+
+        SkipManager.set_step(self.global_steps)
+
+        prev_step_profile = False
+        curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        next_step_profile = False
+
+        for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            for batch_dict in self.train_dataloader:
+                if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+                    self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
+                metrics = {}
+                timing_raw = {}
+
+                with marked_timer("start_profile", timing_raw):
+                    self._start_profiling(
+                        not prev_step_profile and curr_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
+                # add uid to batch
+                batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                )
+
+                gen_batch = self._get_gen_batch(batch)
+
+                # pass global_steps to trace
+                gen_batch.meta_info["global_steps"] = self.global_steps
+                rollout_n = self.config.actor_rollout_ref.rollout.n
+                gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+
+                if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                    # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
+                    # Keep them in a single agent-loop/vLLM request to avoid sending a second
+                    # rollout after replicas have been put to sleep, which can leave async vLLM
+                    # engines in an invalid state for multi-turn agent workloads.
+                    gen_batch_output.non_tensor_batch["__do_sample__"] = np.ones(len(gen_batch_output), dtype=bool)
+                    gen_baseline_batch = gen_batch.slice(0, None)
+                    gen_baseline_batch.non_tensor_batch["__do_sample__"] = np.zeros(len(gen_baseline_batch), dtype=bool)
+                    combined_gen_batch = DataProto.concat([gen_batch_output, gen_baseline_batch])
+                    num_sampled_prompts = len(gen_batch_output)
+                else:
+                    combined_gen_batch = gen_batch_output
+                    num_sampled_prompts = len(gen_batch_output)
+
+                is_last_step = self.global_steps >= self.total_training_steps
+                with marked_timer("step", timing_raw):
+                    # generate a batch
+                    with marked_timer("gen", timing_raw, color="red"):
+                        if curr_step_profile:
+                            self.llm_server_manager.start_profile()
+                        combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+                        self.checkpoint_manager.sleep_replicas()
+                        if curr_step_profile:
+                            self.llm_server_manager.stop_profile()
+
+                        timing_raw.update(combined_gen_output.meta_info["timing"])
+                        combined_gen_output.meta_info.pop("timing", None)
+
+                    gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
+                    if "__do_sample__" in gen_batch_output.non_tensor_batch:
+                        gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
+
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)
+                        if "__do_sample__" in gen_baseline_output.non_tensor_batch:
+                            gen_baseline_output.pop(non_tensor_batch_keys=["__do_sample__"])
+
+                        if self.use_rm and "rm_scores" not in gen_baseline_output.batch.keys():
+                            baseline_reward = self._compute_reward_colocate(gen_baseline_output)
+                            gen_baseline_output = gen_baseline_output.union(baseline_reward)
+
+                        reward_baseline_tensor = gen_baseline_output.batch["rm_scores"].sum(dim=-1)
+                        batch.batch["reward_baselines"] = reward_baseline_tensor
+
+                        del gen_baseline_output
+                    del combined_gen_batch, combined_gen_output
+                    # repeat to align with repeated responses in rollout
+                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch = batch.union(gen_batch_output)
+
+                    if "response_mask" not in batch.batch.keys():
+                        batch.batch["response_mask"] = compute_response_mask(batch)
+                    # Is the multi-turn structure actually reaching the optimizer?
+                    # (trained_token_frac == 1.0 and tool_call_in_trained_frac == 0.0
+                    # means the trajectory carries no masked tool spans and no query
+                    # tokens — i.e. retrieval is not being trained.)
+                    metrics.update(compute_trained_span_metrics(batch, self.tokenizer))
+                    # Balance the number of valid tokens across DP ranks.
+                    # NOTE: This usually changes the order of data in the `batch`,
+                    # which won't affect the advantage calculation (since it's based on uid),
+                    # but might affect the loss calculation (due to the change of mini-batching).
+                    if self.config.trainer.balance_batch:
+                        self._balance_batch(batch, metrics=metrics)
+
+                    # compute global_valid tokens
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    # get images_seqlens
+                    images_seqlens_all = []
+                    for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
+                        if "image_grid_thw" not in multi_modal_input.keys():
+                            continue
+                        images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
+                    batch.meta_info["images_seqlens"] = images_seqlens_all
+                    with marked_timer("reward", timing_raw, color="yellow"):
+                        # compute reward model score
+                        if self.use_rm and "rm_scores" not in batch.batch.keys():
+                            batch_reward = self._compute_reward_colocate(batch)
+                            batch = batch.union(batch_reward)
+
+                        # extract reward_tensor and reward_extra_infos_dict for training
+                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                        # Retrieval-quality component, folded GROUP-RELATIVELY. Must
+                        # run before zero-variance filtering, since it can create the
+                        # variance that keeps a group alive.
+                        reward_tensor, _rq_metrics = _fold_retrieval_group_bonus(
+                            batch, reward_tensor, reward_extra_infos_dict
+                        )
+                        metrics.update(_rq_metrics)
+
+                        # Optional DAPO-lite dynamic filtering (trainer.filter_zero_variance_groups):
+                        # drop GRPO groups whose rewards have (near-)zero variance — they carry no
+                        # policy gradient (advantage 0 after group normalization) but dilute the
+                        # batch and waste old_log_prob/ref/update compute. Unlike full DAPO dynamic
+                        # sampling we do NOT regenerate; the batch just shrinks by whole groups.
+                        if bool(
+                            OmegaConf.select(self.config, "trainer.filter_zero_variance_groups") or False
+                        ):
+                            batch, reward_tensor, reward_extra_infos_dict, _fg_metrics = (
+                                self._filter_zero_variance_groups(batch, reward_tensor, reward_extra_infos_dict)
+                            )
+                            metrics.update(_fg_metrics)
+
+                        # Measure this step's SPECIFICATION GAP: for each group, does
+                        # the generated rubric's ordering of the rollouts agree with a
+                        # rubric-BLIND referee's? Started here (after the zero-variance
+                        # filter, so no referee call is spent on a group about to be
+                        # dropped) and joined after compute_advantage, so the HTTP hides
+                        # behind the old_log_prob / ref_log_prob forward passes.
+                        self._submit_spec_gap(batch, reward_extra_infos_dict)
+
+                    # Operating Mode Selection:
+                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                        from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+
+                        apply_bypass_mode(
+                            batch=batch,
+                            rollout_corr_config=rollout_corr_config,
+                            policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+                        )
+                    else:  # Recompute old_log_probs
+                        with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            actor_config = self.config.actor_rollout_ref.actor
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys,
+                                loss_mask=response_masks,
+                                loss_agg_mode=actor_config.loss_agg_mode,
+                                loss_scale_factor=actor_config.loss_scale_factor,
+                            )
+                            old_log_prob_metrics = {
+                                "actor/entropy": entropy_agg.detach().item(),
+                                "perf/mfu/actor_infer": old_log_prob_mfu,
+                            }
+                            metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
+                            if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
+                                raise ValueError(
+                                    "Detected conflicting router replay configuration: "
+                                    "router_replay.mode='R2' and enable_rollout_routing_replay=True "
+                                    "cannot be enabled simultaneously. "
+                                    "The enable_rollout_routing_replay option is only used in R3 mode; "
+                                    "it should not be set when using R2 mode."
+                                )
+                            batch = batch.union(old_log_prob)
+                            if "rollout_log_probs" in batch.batch.keys():
+                                # TODO: we may want to add diff of probs too.
+                                from verl.utils.debug.metrics import calculate_debug_metrics
+
+                                metrics.update(calculate_debug_metrics(batch))
+
+                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+
+                    if self.use_reference_policy:
+                        # compute reference log_prob
+                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            ref_log_prob = self._compute_ref_log_prob(batch)
+                            batch = batch.union(ref_log_prob)
+
+                    # compute values
+                    if self.use_critic:
+                        with marked_timer("values", timing_raw, color="cyan"):
+                            values = self._compute_values(batch)
+                            batch = batch.union(values)
+
+                    with marked_timer("adv", timing_raw, color="brown"):
+                        # we combine with rule-based rm
+                        reward_extra_infos_dict: dict[str, list]
+                        batch.batch["token_level_scores"] = reward_tensor
+
+                        if reward_extra_infos_dict:
+                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            # Per-component reward training metrics. Mirrors what
+                            # _val_metrics_update emits for validation, so wandb
+                            # has e.g. reward/acc/mean alongside reward/score/mean.
+                            # Values may be Python lists or numpy arrays; `len`
+                            # is the safe emptiness check for both.
+                            for _key, _lst in reward_extra_infos_dict.items():
+                                try:
+                                    _arr = np.asarray(_lst, dtype=np.float64)
+                                except (TypeError, ValueError):
+                                    continue  # non-numeric extras (e.g. extracted_answer)
+                                if _arr.size == 0 or not np.all(np.isfinite(_arr)):
+                                    continue
+                                metrics[f"reward/{_key}/mean"] = float(_arr.mean())
+                                metrics[f"reward/{_key}/max"] = float(_arr.max())
+                                metrics[f"reward/{_key}/min"] = float(_arr.min())
+
+                        # compute rewards. apply_kl_penalty if available
+                        if self.config.algorithm.use_kl_in_reward:
+                            batch, kl_metrics = apply_kl_penalty(
+                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                            )
+                            metrics.update(kl_metrics)
+                        else:
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # Compute rollout correction: IS weights, rejection sampling, and metrics
+                        # Only runs in decoupled mode (computes once per batch using stable π_old)
+                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        if (
+                            rollout_corr_config is not None
+                            and "rollout_log_probs" in batch.batch
+                            and not bypass_recomputing_logprobs  # Only in decoupled mode
+                        ):
+                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+                            # Compute IS weights, apply rejection sampling, compute metrics
+                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                            # IS and off-policy metrics already have rollout_corr/ prefix
+                            metrics.update(is_metrics)
+
+                        # compute advantages, executed on the driver process
+                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                            "norm_adv_by_std_in_grpo", True
+                        )  # GRPO adv normalization factor
+
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
+                        )
+
+                    # Join the specification-gap measurement started before
+                    # old_log_prob. Records H and buffers the exploits it found; it
+                    # changes nothing the actor trains on.
+                    with marked_timer("spec_gap", timing_raw, color="purple"):
+                        _sg_metrics = self._record_spec_gap(batch, reward_extra_infos_dict)
+                        if _sg_metrics:
+                            metrics.update(_sg_metrics)
+
+                    # update critic
+                    if self.use_critic:
+                        with marked_timer("update_critic", timing_raw, color="pink"):
+                            critic_output = self._update_critic(batch)
+                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                        metrics.update(critic_output_metrics)
+
+                    # implement critic warmup
+                    if self.config.trainer.critic_warmup > self.global_steps:
+                        # Still in critic warmup, only update weights to wake up rollout replicas.
+                        self.checkpoint_manager.update_weights(self.global_steps)
+                    else:
+                        # update actor
+                        with marked_timer("update_actor", timing_raw, color="red"):
+                            actor_output = self._update_actor(batch)
+
+                        # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                        esi_close_to_expiration = should_save_ckpt_esi(
+                            max_steps_duration=self.max_steps_duration,
+                            redundant_time=self.config.trainer.esi_redundant_time,
+                        )
+                        # Check if the conditions for saving a checkpoint are met.
+                        # The conditions include a mandatory condition (1) and
+                        # one of the following optional conditions (2/3/4):
+                        # 1. The save frequency is set to a positive value.
+                        # 2. It's the last training step.
+                        # 3. The current step number is a multiple of the save frequency.
+                        # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+                        if self.config.trainer.save_freq > 0 and (
+                            is_last_step
+                            or self.global_steps % self.config.trainer.save_freq == 0
+                            or esi_close_to_expiration
+                        ):
+                            if esi_close_to_expiration:
+                                print("Force saving checkpoint: ESI instance expiration approaching.")
+                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                self._save_checkpoint()
+
+                        # update weights from trainer to rollout
+                        with marked_timer("update_weights", timing_raw, color="red"):
+                            self.checkpoint_manager.update_weights(self.global_steps)
+
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
+
+                    # Log rollout generations if enabled
+                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                    if rollout_data_dir:
+                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+                    # Optional, training-only: evolve the judge prompt + executable function
+                    # reward at end of step (off by default; returns {} when disabled).
+                    evo_metrics = self._maybe_evolve_reward(batch, reward_extra_infos_dict)
+                    if evo_metrics:
+                        metrics.update(evo_metrics)
+
+                    # Optional, training-only: evolve the GENERATION prompts (rubric mode).
+                    # Samples this step's rubric rollouts and POSTs them to the gen
+                    # server's /evolve endpoint (off by default; {} when disabled).
+                    gen_evo_metrics = self._maybe_evolve_generation(batch, reward_extra_infos_dict)
+                    if gen_evo_metrics:
+                        metrics.update(gen_evo_metrics)
+
+                    # Optional, training-only: evolve the RETRIEVAL reward itself
+                    # (the coverage judge), so the signal that teaches the policy
+                    # how to query gets sharper as the run proceeds.
+                    cov_evo_metrics = self._maybe_evolve_retrieval_reward(
+                        batch, reward_extra_infos_dict
+                    )
+                    if cov_evo_metrics:
+                        metrics.update(cov_evo_metrics)
+
+                    # Optional, training-only: evolve the SOLVER system prompt.
+                    # Used by fixed-dataset runs, where there is no task
+                    # generator to evolve instead.
+                    solver_evo_metrics = self._maybe_evolve_solver_prompt(
+                        batch, reward_extra_infos_dict
+                    )
+                    if solver_evo_metrics:
+                        metrics.update(solver_evo_metrics)
+
+                # validate
+                if self.config.trainer.test_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+                ):
+                    with marked_timer("testing", timing_raw, color="green"):
+                        val_metrics: dict = self._validate()
+                        self._record_val_score(val_metrics)
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                    metrics.update(val_metrics)
+
+                with marked_timer("stop_profile", timing_raw):
+                    next_step_profile = (
+                        self.global_steps + 1 in self.config.global_profiler.steps
+                        if self.config.global_profiler.steps is not None
+                        else False
+                    )
+                    self._stop_profiling(
+                        curr_step_profile and not next_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+                    prev_step_profile = curr_step_profile
+                    curr_step_profile = next_step_profile
+
+                steps_duration = timing_raw["step"]
+                self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+
+                # training metrics
+                metrics.update(
+                    {
+                        "training/global_step": self.global_steps,
+                        "training/epoch": epoch,
+                    }
+                )
+                # collect metrics
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # GDPO per-component reward metrics
+                gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
+                if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
+                    for key in gdpo_reward_keys:
+                        if key in batch.non_tensor_batch:
+                            vals = np.asarray(batch.non_tensor_batch[key], dtype=np.float32)
+                            metrics[f"gdpo/{key}/mean"] = float(np.mean(vals))
+                            metrics[f"gdpo/{key}/std"] = float(np.std(vals))
+                            metrics[f"gdpo/{key}/max"] = float(np.max(vals))
+                            metrics[f"gdpo/{key}/min"] = float(np.min(vals))
+                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                # TODO: implement actual tflpo and theoretical tflpo
+                n_gpus = self.resource_pool_manager.get_n_gpus()
+                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                # compute variance proxy metrics
+                gradient_norm = metrics.get("actor/grad_norm", None)
+                metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+                # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+
+                # Per-request spec decode metrics.
+                metrics.update(
+                    compute_spec_decode_metrics(
+                        batch.non_tensor_batch.get("spec_num_draft_tokens", None),
+                        batch.non_tensor_batch.get("spec_num_accepted_tokens", None),
+                        batch.non_tensor_batch.get("spec_num_verify_steps", None),
+                    )
+                )
+
+                # TODO: make a canonical logger that supports various backend
+                logger.log(data=metrics, step=self.global_steps)
+
+                progress_bar.update(1)
+                self.global_steps += 1
+                SkipManager.set_step(self.global_steps)
+
+                if is_last_step:
+                    if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+                        self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    self._shutdown_dump_executor()
+                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    progress_bar.close()
+                    return
+
+                # this is experimental and may be changed/removed in the future
+                # in favor of a general-purpose data buffer pool
+                if hasattr(self.train_dataset, "on_batch_end"):
+                    # The dataset may be changed after each training batch
+                    self.train_dataset.on_batch_end(batch=batch)
+
+        # Ensure dump executor is shut down when training loop ends without reaching is_last_step
+        self._shutdown_dump_executor()

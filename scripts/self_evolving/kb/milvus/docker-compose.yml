@@ -1,0 +1,70 @@
+# Milvus standalone for the medical knowledge base (scripts/self_evolving/kb/README.md).
+#
+#   cd scripts/self_evolving/kb/milvus
+#   MILVUS_DATA=/path/with/space docker compose up -d
+#
+# Milvus listens on localhost:19530 (gRPC) and :9091 (health). Authentication is on;
+# the first login is root / Milvus. Change that password before exposing the port:
+#   python -c "from pymilvus import MilvusClient as C; \
+#              C('http://localhost:19530', token='root:Milvus').update_password('root', 'Milvus', 'NEW')"
+# and pass MILVUS_TOKEN=root:NEW to the pipeline.
+#
+# The full knowledge base (~57M passages at 2048 dims, HNSW_SQ) needs ~0.5 TB of disk
+# for the volumes; a corpus of your own documents needs far less.
+# For a GPU index build, switch the image to milvusdb/milvus:v2.6.15-gpu and add a
+# device reservation to the standalone service.
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ${MILVUS_DATA:-./volumes}/etcd:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - ${MILVUS_DATA:-./volumes}/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  standalone:
+    image: milvusdb/milvus:v2.6.15
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MQ_TYPE: woodpecker
+    volumes:
+      - ${MILVUS_DATA:-./volumes}/milvus:/var/lib/milvus
+      - ./user.yaml:/milvus/configs/user.yaml
+    ports:
+      - "127.0.0.1:19530:19530"
+      - "127.0.0.1:9091:9091"
+    depends_on:
+      - etcd
+      - minio
+
+networks:
+  default:
+    name: milvus-net

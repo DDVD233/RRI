@@ -1,0 +1,13 @@
+# Extra dependencies of the RRI pipeline on top of requirements.txt (verl) and a
+# vLLM install (vllm>=0.22 for Qwen3.5 / Qwen3.6; see docker/Dockerfile.rri).
+aiohttp
+fastapi
+httpx
+huggingface_hub
+nltk
+pillow
+pydantic
+pymilvus>=2.6
+pyyaml
+requests
+uvicorn

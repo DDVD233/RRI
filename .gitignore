@@ -1,0 +1,29 @@
+# secrets and local settings
+.env
+*.env
+!scripts/self_evolving/env.example
+
+# data, outputs, checkpoints, caches
+data/
+outputs/
+checkpoints/
+wandb/
+*.sqlite
+*.sqlite-*
+scripts/self_evolving/kb/milvus/volumes/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# editors
+.idea/
+.vscode/
+*.swp
